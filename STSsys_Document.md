@@ -336,7 +336,6 @@ erDiagram
         ENUM kind
         VARCHAR(1024) file_path
         VARCHAR(100) mime_type
-        INT duration_ms
         BIGINT file_size_bytes
         DATETIME(6) created_at
     }
@@ -430,11 +429,12 @@ DBにはUTCで保存し、画面表示時にローカル時刻へ変換します
 | kind | `ENUM('input', 'output')` | 入力音声か出力音声か |
 | file_path | `VARCHAR(1024)` | Backend側で保存している音声ファイルのパス |
 | mime_type | `VARCHAR(100)` | `audio/wav` などのMIME type |
-| duration_ms | `INT NULL` | 音声の長さ |
 | file_size_bytes | `BIGINT NULL` | ファイルサイズ |
 | created_at | `DATETIME(6)` | 作成日時。UTC |
 
 `kind` は、ユーザーが話した録音音声を `input`、TTSで生成されたAI返答音声を `output` とします。
+
+<span style="color:red">`audio_files.duration_ms` は、初期版では画面表示や処理判定に使用しないため、カラムから削除します。音声処理にかかった時間は `turn_events.duration_ms` で管理します。</span>
 
 ### turn_events
 
@@ -557,7 +557,6 @@ Avaloniaの画面は、チャットUIを中心にします。
 - AI返答の吹き出し
 - PushToTalkボタン
 - 処理状態表示
-- AI音声の再生ボタン
 - エラー表示
 
 画面上の基本状態は次の通りです。
@@ -569,7 +568,7 @@ Avaloniaの画面は、チャットUIを中心にします。
 | 応答準備中 | STT、Gemini、TTSなどの内部状態は細かく表示せず、必要に応じてまとめて表示 |
 | ユーザー発話表示 | STT結果をユーザー発話の吹き出しとして表示 |
 | AI返答表示 | Gemini返答をAI返答の吹き出しとして表示 |
-| 音声再生可能 | TTS音声を再生できる状態にする |
+| 音声再生 | TTS音声の生成完了後、Backendから取得して自動再生する |
 | 失敗 | どの段階で失敗したか分かるメッセージを表示 |
 
 ## 14. エラー設計

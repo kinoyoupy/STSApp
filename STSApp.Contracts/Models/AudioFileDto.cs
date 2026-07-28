@@ -15,6 +15,5 @@ public sealed record AudioFileDto(
     AudioFileKind Kind,
     string FilePath,
     string MimeType,
-    int? DurationMs,
     long? FileSizeBytes,
     DateTime CreatedAt);
