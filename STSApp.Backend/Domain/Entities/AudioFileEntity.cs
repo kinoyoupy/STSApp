@@ -8,10 +8,15 @@ namespace STSApp.Backend.Domain.Entities;
 /// </summary>
 public sealed class AudioFileEntity
 {
+    // 音声参照レコード自体を識別するUUIDです。
     public Guid Id { get; init; }
+    // どの会話ターンに属する音声かを示します。
     public Guid ConversationTurnId { get; init; }
+    // inputならユーザー音声、outputならTTS音声です。
     public AudioFileKind Kind { get; init; }
+    // 実ファイルの相対パスです。音声本体はここには入りません。
     public string FilePath { get; init; } = string.Empty;
+    // audio/wavなど、再生時に形式を判断する値です。
     public string MimeType { get; init; } = string.Empty;
     public int? DurationMs { get; init; }
     public long? FileSizeBytes { get; init; }

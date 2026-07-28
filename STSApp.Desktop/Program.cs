@@ -5,14 +5,14 @@ namespace STSApp.Desktop;
 
 class Program
 {
-    // Initialization code. Don't use any Avalonia, third-party APIs or any
-    // SynchronizationContext-reliant code before AppMain is called: things aren't initialized
-    // yet and stuff might break.
+    // デスクトップアプリの開始地点です。
+    // Avaloniaの画面やマイクなど、UIに依存する処理はAvaloniaの初期化後に実行します。
     [STAThread]
     public static void Main(string[] args) => BuildAvaloniaApp()
         .StartWithClassicDesktopLifetime(args);
 
-    // Avalonia configuration, don't remove; also used by visual designer.
+    // Avaloniaの基本設定をまとめます。
+    // UsePlatformDetectにより、実行しているOSに合わせた画面機能が選ばれます。
     public static AppBuilder BuildAvaloniaApp()
         => AppBuilder.Configure<App>()
             .UsePlatformDetect()

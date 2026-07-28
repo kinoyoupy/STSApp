@@ -30,13 +30,19 @@ public sealed class ChatMessageItem
         TurnId = turnId;
     }
 
+    // 画面上部に表示する「ユーザー」「アシスタント」「システム」のラベルです。
     public string Speaker { get; }
+    // 実際に吹き出しへ表示する本文です。
     public string Text { get; }
+    // 発話者ごとの背景色と枠線です。UIの見た目だけに関係します。
     public IBrush Background { get; }
     public IBrush BorderBrush { get; }
     public IBrush SpeakerColor { get; }
+    // ユーザー発話を右、AI返答やシステム通知を左に寄せるための値です。
     public HorizontalAlignment Alignment { get; }
+    // 履歴更新時に会話ターンとして扱うかを区別します。
     public bool IsConversationMessage { get; }
+    // Backendのターンと画面カードを結びつけるIDです。
     public Guid? TurnId { get; }
 
     public static ChatMessageItem User(string text, Guid? turnId = null)

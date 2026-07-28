@@ -5,9 +5,13 @@
 #import <Foundation/Foundation.h>
 
 struct STSAudioRecorder {
+    // macOSの録音担当オブジェクトです。
     AVAudioRecorder *recorder;
+    // WAVを一時保存する場所です。C#側へコピーした後に削除します。
     NSString *filePath;
+    // 入力音声のサンプルレートです。現在はC#側から16000を受け取ります。
     int sampleRate;
+    // StartからStopまで録音中かを示します。
     BOOL running;
 };
 
@@ -56,6 +60,8 @@ int sts_audio_recorder_start(STSAudioRecorder *recorder, char *error_message, in
     // 前回の一時ファイルが残っていても、今回の録音へ混ざらないように削除します。
     [[NSFileManager defaultManager] removeItemAtPath:recorder->filePath error:nil];
 
+    // AVAudioRecorderが扱う録音形式を、STTへ送るWAVの仕様に合わせます。
+    // モノラル・16bit PCMに固定して、毎回同じ形式のファイルを作ります。
     NSURL *fileURL = [NSURL fileURLWithPath:recorder->filePath];
     NSDictionary *settings = @{
         AVFormatIDKey: @(kAudioFormatLinearPCM),
@@ -112,6 +118,8 @@ int sts_audio_recorder_copy_wav(STSAudioRecorder *recorder, uint8_t **data, int 
         return 0;
     }
 
+    // Stop後に一時WAVを読み込み、C#が受け取れるmalloc領域へコピーします。
+    // 呼び出し元のC#側は、コピー後にNativeFreeでこの領域を解放します。
     NSData *wavData = [NSData dataWithContentsOfFile:recorder->filePath];
     if (wavData == nil || wavData.length == 0 || wavData.length > INT32_MAX) {
         return 0;

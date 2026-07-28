@@ -7,7 +7,9 @@ namespace STSApp.Contracts.Events;
 /// どの段階で失敗したかを stage で表します。
 /// </summary>
 public sealed record TurnFailedEvent(
+    // 失敗した会話セッションのUUIDです。
     Guid ConversationId,
+    // 失敗したターンのUUIDです。
     Guid TurnId,
     ProcessingStage Stage,
     string Message);

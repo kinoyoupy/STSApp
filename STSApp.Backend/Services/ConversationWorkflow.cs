@@ -12,6 +12,10 @@ namespace STSApp.Backend.Services;
 /// <summary>
 /// 1回の音声入力に対する処理の流れをまとめます。
 /// 音声アップロード、STT、Gemini、TTSの順番をここで制御します。
+///
+/// 各処理をここに集める理由は、音声対話の順番と失敗箇所を1か所で管理するためです。
+/// STTやGeminiの内部処理までここへ書かず、担当クラスへ分けることで、
+/// APIを差し替えても全体の流れを読み直さずに済みます。
 /// </summary>
 public sealed class ConversationWorkflow : IConversationWorkflow
 {
@@ -87,8 +91,8 @@ public sealed class ConversationWorkflow : IConversationWorkflow
 
         try
         {
-            // STT: ユーザーの音声を文字に変換します。
-            // ここが成功すると、AvaloniaのチャットUIにユーザー発話を表示できます。
+            // STTを最初に呼ぶ理由は、Geminiが音声ファイルではなく文字を受け取る設計だからです。
+            // ここで音声を文字へ変え、以降の処理で使えるユーザー発話を作ります。
             await AddEventAndNotifyAsync(
                 conversationId,
                 turn.Id,
@@ -125,8 +129,9 @@ public sealed class ConversationWorkflow : IConversationWorkflow
 
             currentStage = ProcessingStage.Gemini;
 
-            // Gemini: STTで得たユーザー発話と直近履歴を使って、AI返答テキストを生成します。
-            // 初期版ではストリーミングではなく、返答テキストが完成してから通知します。
+            // Geminiへ音声ではなく文字を渡す理由は、今回のGeminiの役割を返答文の生成に限定するためです。
+            // 直近履歴も渡すのは、現在の発話だけでは会話の流れを判断できない場合があるためです。
+            // 文章が完成してから通知するのは、初期版で途中の文章を扱う処理を増やさないためです。
             await AddEventAndNotifyAsync(
                 conversationId,
                 turn.Id,
@@ -167,8 +172,8 @@ public sealed class ConversationWorkflow : IConversationWorkflow
 
             currentStage = ProcessingStage.Tts;
 
-            // TTS: Geminiが作った返答テキストを音声に変換します。
-            // テキストは先にUIへ出し、音声は生成が終わってからaudioIdを通知します。
+            // TTSを最後に呼ぶ理由は、まずGeminiの返答文を確定させる必要があるためです。
+            // 返答文を先に画面へ表示するのは、音声生成を待つ間もAIの結果を確認できるようにするためです。
             await AddEventAndNotifyAsync(
                 conversationId,
                 turn.Id,
@@ -231,8 +236,8 @@ public sealed class ConversationWorkflow : IConversationWorkflow
         }
         catch (Exception ex)
         {
-            // どの段階で失敗したかを currentStage に入れておくことで、
-            // STT失敗・Gemini失敗・TTS失敗をDBとSignalRの両方へ同じ意味で残せます。
+            // 失敗した段階を記録する理由は、「音声・文字起こし・AI・音声合成」のどこに問題があるかを区別するためです。
+            // 同じ情報をDBと画面通知へ残すことで、今すぐの案内と後からの調査の両方に使えます。
             var userMessage = currentStage switch
             {
                 ProcessingStage.Tts => "返答音声を生成できませんでした。",
@@ -277,8 +282,8 @@ public sealed class ConversationWorkflow : IConversationWorkflow
         int? durationMs,
         CancellationToken cancellationToken)
     {
-        // DB保存とSignalR通知を必ずセットにしたいので、共通メソッドにしています。
-        // DBのturn_eventsは後から履歴・調査に使い、SignalRは今開いている画面の即時更新に使います。
+        // この処理を共通化する理由は、状態をDBへ保存したのに画面へ通知し忘れる不一致を防ぐためです。
+        // DBは後から確認するため、SignalRは今見ている画面へ知らせるために使い分けます。
         await _repository.AddTurnEventAsync(
             turnId,
             stage,

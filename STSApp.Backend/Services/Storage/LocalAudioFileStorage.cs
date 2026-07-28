@@ -63,6 +63,8 @@ public sealed class LocalAudioFileStorage : IAudioFileStorage
         string fileExtension,
         CancellationToken cancellationToken)
     {
+        // TTSの返答音声は、入力音声と混ざらないようoutput側へ保存します。
+        // DBにはこの戻り値のFilePathを登録し、音声本体はDBへ格納しません。
         var extension = NormalizeExtension(fileExtension, mimeType);
 
         // TTSで生成された返答音声は output 配下に保存します。

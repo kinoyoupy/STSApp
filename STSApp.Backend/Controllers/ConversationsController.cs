@@ -31,6 +31,8 @@ public sealed class ConversationsController : ControllerBase
         CreateConversationRequest request,
         CancellationToken cancellationToken)
     {
+        // ControllerはHTTPの入口です。
+        // 実際のDB操作はRepositoryへ渡し、ここではリクエストとレスポンスの変換に集中します。
         var conversation = await _repository.CreateConversationAsync(request.Title, cancellationToken);
         return Ok(new ConversationCreatedResponse(conversation.Id));
     }
@@ -58,6 +60,8 @@ public sealed class ConversationsController : ControllerBase
         IFormFile audioFile,
         CancellationToken cancellationToken)
     {
+        // IFormFileはmultipart/form-dataで送られたファイルをASP.NET Coreが受け取った型です。
+        // 空ファイルを先に拒否することで、STT APIへ意味のない通信を送らずに済みます。
         if (audioFile.Length == 0)
         {
             return BadRequest("音声ファイルが空です。");

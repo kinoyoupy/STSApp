@@ -17,6 +17,8 @@ namespace STSApp.Desktop;
 
 public partial class MainWindow : Window
 {
+    // 画面とSTT/Gemini/TTSを分ける理由は、画面の変更でAI連携まで壊れないようにするためです。
+    // MainWindowはユーザー操作と結果表示に集中し、処理本体はBackendへ任せます。
     // ObservableCollection は、会話履歴をアプリ内部で保持するためのコレクションです。
     // 現在の画面はMessagesPanelへカードを明示的に追加する構成のため、
     // 画面への反映はAddMessageToPanelなどの処理が担当します。
@@ -115,12 +117,10 @@ public partial class MainWindow : Window
             return;
         }
 
-        // ボタンの外で指やマウスを離しても終了イベントを拾えるように、
-        // 押下中はポインターをこのボタンに捕まえておきます。
+        // ボタンの外で離した場合も録音を止める必要があるため、押している間はポインターを捕まえます。
         e.Pointer.Capture(PushToTalkButton);
 
-        // PushToTalk は「押している間だけ録音」する操作です。
-        // 録音開始時点でマイク権限や入力デバイスの問題があれば、ここで分かるようにします。
+        // 押している時間と録音時間を一致させるため、押下で開始し、解放で停止して送信します。
         try
         {
             _audioRecorder.Start();
@@ -257,8 +257,8 @@ public partial class MainWindow : Window
 
     private void RegisterSignalREvents()
     {
-        // SignalRのイベントはUIスレッドとは別の場所で呼ばれることがあります。
-        // Avaloniaの画面要素を更新する時は、RunOnUiThreadを通してUIスレッドへ戻します。
+        // Avaloniaの画面部品を安全に更新するため、通知を画面用の処理場所へ戻します。
+        // SignalRの通知元と画面の処理場所が別になる可能性があるためです。
         _conversationHubClient.TurnStatusChanged += value =>
         {
             RunOnUiThread(() => HandleTurnStatusChanged(value));
@@ -334,8 +334,8 @@ public partial class MainWindow : Window
             return;
         }
 
-        // Backendは upload / stt / gemini / tts のような細かい状態を通知します。
-        // 初期UIではその詳細をシステムメッセージとして見せ、動作確認しやすくしています。
+        // 状態をカードにも表示する理由は、処理がどこまで進んだかを目で確認できるようにするためです。
+        // Backendから届く「アップロード中」「文字起こし完了」などをそのまま表示します。
         var stageText = FormatStage(value.Stage);
         var eventText = FormatEventType(value.EventType);
         var message = string.IsNullOrWhiteSpace(value.Message)
@@ -379,8 +379,8 @@ public partial class MainWindow : Window
 
     private bool IsCurrentConversation(Guid conversationId)
     {
-        // SignalRは現在Allクライアントへ通知しています。
-        // そのため、自分が開いている会話IDの通知だけを画面に反映します。
+        // 会話IDを確認する理由は、別の会話の通知を自分の画面へ混ぜないためです。
+        // 現在は接続中の画面へ広く通知されるため、ここで絞り込みます。
         return _conversationId is not null && _conversationId.Value == conversationId;
     }
 
@@ -441,8 +441,8 @@ public partial class MainWindow : Window
                 _conversationId.Value,
                 _windowClosingTokenSource.Token);
 
-            // 履歴更新では、画面のメッセージ一覧をDBの状態に合わせて作り直します。
-            // これにより、SignalRを取り逃してもBackendに保存済みの状態へ戻せます。
+            // DBから履歴を取り直す理由は、リアルタイム通知を取り逃した場合でも画面を復元できるようにするためです。
+            // SignalRは即時表示、履歴取得は保存済み状態の確認という役割分担です。
             ReplaceMessagesFromTurns(turns);
             StatusText.Text = $"Backend接続済み / {turns.Count}ターン";
             InputHintText.Text = "履歴を更新しました。";
@@ -457,8 +457,8 @@ public partial class MainWindow : Window
 
     private void ReplaceMessagesFromTurns(IReadOnlyList<ConversationTurnDto> turns)
     {
-        // SignalRで先に届いた発話は、履歴取得の時点ではまだDBへ反映されていないことがあります。
-        // 再描画前にターンID付きの表示を退避し、DBの項目が空ならその表示を戻します。
+        // 通知とDB保存の順番が前後する可能性があるため、画面に出た発話を一時退避します。
+        // これにより、保存前に履歴更新しても表示が消えません。
         var displayedConversationMessages = _messages
             .Where(x => x.IsConversationMessage && x.TurnId is not null)
             .ToList();
@@ -550,7 +550,8 @@ public partial class MainWindow : Window
     private void AddMessageToPanel(ChatMessageItem message)
     {
         _messages.Add(message);
-        // 終端領域を常に最後に置くため、新しいカードはその直前へ挿入します。
+        // 最後のカードを画面内へ入れるため、下に余白を置いています。
+        // カードの後ろに余白がないと、スクロールの終点でカードが下に隠れるためです。
         var spacerIndex = Math.Max(0, MessagesPanel.Children.Count - 1);
         MessagesPanel.Children.Insert(spacerIndex, CreateMessageCard(message));
         ScrollToLatestMessage();
@@ -560,7 +561,8 @@ public partial class MainWindow : Window
     {
         return new Border
         {
-            // 初期値は0にし、レイアウト後に最後尾カードの不足量から決めます。
+            // 画面サイズやカードの高さは実行時に変わるため、余白を固定値にしません。
+            // まず0で作り、実際の配置後に必要な量を計算します。
             Height = 0,
             IsHitTestVisible = false
         };
@@ -586,20 +588,18 @@ public partial class MainWindow : Window
             return;
         }
 
-        // カードの位置はScrollViewerの表示座標、Extentはスクロール内容の座標です。
-        // Offsetを足して同じ内容座標へそろえます。
+        // 最後のカードが隠れている量を正しく測るため、カードと一覧の下端を同じ基準で比べます。
+        // そのために、現在どこまでスクロールしているかを加えます。
         var lastCardBottomInContent = lastCardBottom.Value + MessagesScrollViewer.Offset.Y;
 
-        // 現在の終端領域を除いた、一覧が認識している終端を求めます。
-        // ここへ最後尾カードが収まっていなければ、その不足分を終端領域へ加えます。
+        // 余白を除いた下端と最後のカードを比べ、はみ出した分だけ余白を必要と判断します。
         var currentSpacerHeight = _messageEndSpacer.Height;
         var contentEndWithoutSpacer = MessagesScrollViewer.Extent.Height - currentSpacerHeight;
         var missingEndSpace = Math.Max(
             0,
             lastCardBottomInContent - contentEndWithoutSpacer);
 
-        // missingEndSpaceは「現在の終端領域を除いた一覧」に対して必要な量です。
-        // 現在値を足し戻すと、画面拡大時や履歴短縮時に余白が縮まらなくなります。
+        // 前回の余白を足し続けると画面更新のたびに増えるため、必要量をそのまま設定します。
         var requiredSpacerHeight = missingEndSpace;
         if (Math.Abs(requiredSpacerHeight - currentSpacerHeight) < 0.5)
         {

@@ -30,6 +30,8 @@ public sealed class PushToTalkAudioRecorder : IDisposable
 
     public void Start()
     {
+        // C#側でも録音状態を確認する理由は、同じボタン操作で録音を二重開始しないためです。
+        // ネイティブ側にも状態はありますが、画面に近いC#側で先に防ぎます。
         if (_startedAt is not null)
         {
             throw new InvalidOperationException("Recording is already running.");
@@ -50,6 +52,8 @@ public sealed class PushToTalkAudioRecorder : IDisposable
 
     public RecordedAudio Stop()
     {
+        // WAVをbyte[]へコピーする理由は、ネイティブ側の一時ファイルを閉じた後でもBackendへ送れるようにするためです。
+        // コピー後のRecordedAudioが、Backendへ送るデータになります。
         if (_startedAt is null)
         {
             throw new InvalidOperationException("Recording has not started.");

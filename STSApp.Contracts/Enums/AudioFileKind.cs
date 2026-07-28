@@ -6,6 +6,9 @@ namespace STSApp.Contracts.Enums;
 /// </summary>
 public enum AudioFileKind
 {
+    // ユーザーがPushToTalkで録音し、Backendへ送った音声です。
     Input,
+
+    // Geminiの返答をTTSへ渡して生成した、AI側の音声です。
     Output
 }

@@ -7,7 +7,9 @@ namespace STSApp.Contracts.Events;
 /// UIにそのまま細かく出す必要はありませんが、Avalonia側で状態をキャッチするために使います。
 /// </summary>
 public sealed record TurnStatusChangedEvent(
+    // 通知を受け取る会話セッションのUUIDです。
     Guid ConversationId,
+    // 通知を受け取るターンのUUIDです。
     Guid TurnId,
     ProcessingStage Stage,
     TurnEventType EventType,

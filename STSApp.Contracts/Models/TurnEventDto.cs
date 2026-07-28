@@ -7,7 +7,9 @@ namespace STSApp.Contracts.Models;
 /// 保守・調査のため、SignalRで通知する情報と近い形で保存します。
 /// </summary>
 public sealed record TurnEventDto(
+    // 内部ログ用のBIGINT連番です。
     long Id,
+    // イベントが属する会話ターンのUUIDです。
     Guid ConversationTurnId,
     ProcessingStage Stage,
     TurnEventType EventType,

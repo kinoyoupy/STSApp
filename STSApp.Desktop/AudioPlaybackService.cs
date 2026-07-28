@@ -8,7 +8,9 @@ namespace STSApp.Desktop;
 
 /// <summary>
 /// Backendから取得した返答音声を再生するクラスです。
-/// 初期版ではmacOS標準の afplay を使い、外部パッケージを増やさずに再生します。
+///
+/// 再生処理を別クラスにする理由は、画面のコードにOS固有の再生方法を混ぜないためです。
+/// macOSのafplayはファイルを再生する仕組みなので、Backendから受け取ったbyte[]を一時ファイルへ書きます。
 /// </summary>
 public sealed class AudioPlaybackService
 {

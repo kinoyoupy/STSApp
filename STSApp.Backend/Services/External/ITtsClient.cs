@@ -6,6 +6,8 @@ namespace STSApp.Backend.Services.External;
 /// </summary>
 public interface ITtsClient
 {
+    // テキストを音声データへ変換します。
+    // 戻り値には保存に必要な形式情報も含めます。
     Task<GeneratedSpeech> SynthesizeAsync(
         string text,
         CancellationToken cancellationToken);
@@ -16,6 +18,9 @@ public interface ITtsClient
 /// MimeType は audio/wav などを想定します。
 /// </summary>
 public sealed record GeneratedSpeech(
+    // TTS APIのレスポンスを読み込むストリームです。
     Stream AudioStream,
+    // audio/wavなど、保存後に再生形式を判断するための値です。
     string MimeType,
+    // outputファイル名に付ける拡張子です。
     string FileExtension);

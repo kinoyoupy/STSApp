@@ -7,7 +7,9 @@ namespace STSApp.Backend.Services.External;
 
 /// <summary>
 /// 既存TTS APIをHTTPで呼び出す実装です。
-/// 仕様: POST /speak、JSONで text などを送り、WAV形式のバイナリを受け取ります。
+///
+/// TTS APIとの通信をここへ分ける理由は、AI返答の作成と音声ファイル取得を別の責任にするためです。
+/// そのため、WorkflowはTTSのURLやレスポンスの細部を意識せずに済みます。
 /// </summary>
 public sealed class HttpTtsClient : ITtsClient
 {
@@ -36,8 +38,8 @@ public sealed class HttpTtsClient : ITtsClient
 
         using var request = new HttpRequestMessage(HttpMethod.Post, BuildRequestUri());
 
-        // TTS APIはJSONでテキストや話者設定を受け取ります。
-        // voicepack/alpha/beta/speed は任意なので、設定されていなければnullとして送ります。
+        // JSONで送る理由は、TTS APIが文章と声質・速度の設定を項目ごとに受け取る仕様だからです。
+        // 任意項目を未設定のまま送る理由は、使わない設定でTTSの既定値を上書きしないためです。
         request.Content = JsonContent.Create(new TtsRequest(
             text,
             ToNullIfWhiteSpace(_options.Voicepack),

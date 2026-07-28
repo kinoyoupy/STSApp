@@ -6,6 +6,8 @@ namespace STSApp.Backend.Services.External;
 /// </summary>
 public interface IGeminiClient
 {
+    // 実HTTPクライアントと開発用モックが同じ形で使えるようにしています。
+    // Workflowは「Geminiが実APIかモックか」を意識しません。
     Task<string> GenerateReplyAsync(
         string userText,
         IReadOnlyList<(string UserText, string AssistantText)> recentTurns,

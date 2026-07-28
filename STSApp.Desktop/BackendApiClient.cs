@@ -15,7 +15,9 @@ namespace STSApp.Desktop;
 
 /// <summary>
 /// AvaloniaアプリからBackendのREST APIを呼び出すための小さなクライアントです。
-/// 画面コードからHttpClientの細かい処理を直接触らないように、ここへ集めます。
+///
+/// 画面と通信処理を分ける理由は、画面の見た目を変更する時にHTTPの処理まで追わなくてよくするためです。
+/// MainWindowは「会話を作る」「音声を送る」と依頼し、URLやJSON・ファイル送信はこのクラスが担当します。
 /// </summary>
 public sealed class BackendApiClient : IDisposable
 {

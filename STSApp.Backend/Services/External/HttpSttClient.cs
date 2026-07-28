@@ -7,7 +7,9 @@ namespace STSApp.Backend.Services.External;
 
 /// <summary>
 /// 既存STT APIをHTTPで呼び出す実装です。
-/// 仕様: POST /transcribe?decoding_type=tdt、multipart/form-data の file に音声を入れます。
+///
+/// STT APIとの通信をここへ分ける理由は、音声対話の流れとHTTPの細かい作業を分離するためです。
+/// WorkflowはURLやJSONの形を知らずに、音声を渡して文字を受け取るだけで済みます。
 /// </summary>
 public sealed class HttpSttClient : ISttClient
 {
@@ -35,8 +37,8 @@ public sealed class HttpSttClient : ISttClient
         using var form = new MultipartFormDataContent();
         using var fileContent = new StreamContent(audioStream);
 
-        // STT APIはJSONではなく、multipart/form-dataで音声ファイルを受け取ります。
-        // form.Add の第2引数 "file" は、STT API仕様で決まっているフィールド名です。
+        // multipart/form-dataを使う理由は、文字列中心のJSONでは音声ファイルをそのまま送れないためです。
+        // form.Addの第2引数「file」は相手のAPIが決めた名前なので、ここを変えると受け取ってもらえません。
         fileContent.Headers.ContentType = new MediaTypeHeaderValue(
             string.IsNullOrWhiteSpace(contentType) ? "application/octet-stream" : contentType);
 

@@ -51,6 +51,8 @@ public sealed class HttpGeminiClient : IGeminiClient
             _options.SystemInstruction,
             BuildInput(userText, recentTurns)));
 
+        // Geminiの応答待ちは非同期で行います。
+        // この間もBackendは他のリクエストを受け付けやすくなります。
         using var response = await _httpClient.SendAsync(request, cancellationToken);
         if (!response.IsSuccessStatusCode)
         {

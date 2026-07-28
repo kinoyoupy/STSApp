@@ -11,7 +11,9 @@ namespace STSApp.Desktop;
 
 /// <summary>
 /// BackendのSignalR Hubへ接続し、会話ターンの状態通知を受け取るクライアントです。
-/// MainWindow側では「接続する」「イベントを受けて画面を変える」ことだけに集中できるようにします。
+///
+/// SignalRを別クラスにする理由は、MainWindowに接続管理の細かい処理を書き込まないためです。
+/// RESTがこちらから問い合わせる通信なのに対し、SignalRはBackendから状態を知らせてもらう通信です。
 /// </summary>
 public sealed class ConversationHubClient : IAsyncDisposable
 {
