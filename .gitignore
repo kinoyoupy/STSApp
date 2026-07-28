@@ -1,0 +1,34 @@
+# Build outputs
+bin/
+obj/
+artifacts/
+publish/
+TestResults/
+coverage/
+
+# User / IDE local files
+.DS_Store
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+.vs/
+.idea/
+
+# Local environment files
+.env
+
+# Backend local settings
+# appsettings.Development.json may contain real API URLs, API keys, or local DB passwords.
+STSApp.Backend/appsettings.Development.json
+
+# Runtime audio files
+# Audio files can contain recorded user speech, so they should not be committed.
+STSApp.Backend/storage/audio/
+
+# Logs
+*.log
+*.pid
+
+# macOS native build artifacts
+*.dSYM/

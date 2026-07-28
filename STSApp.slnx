@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="STSApp.Backend/STSApp.Backend.csproj" />
+  <Project Path="STSApp.Contracts/STSApp.Contracts.csproj" />
+  <Project Path="STSApp.Desktop/STSApp.Desktop.csproj" />
+</Solution>

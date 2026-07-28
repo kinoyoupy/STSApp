@@ -1,0 +1,73 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:local="using:STSApp.Desktop"
+        mc:Ignorable="d" d:DesignWidth="980" d:DesignHeight="680"
+        x:Class="STSApp.Desktop.MainWindow"
+        Title="STS 音声対話"
+        MinWidth="760"
+        MinHeight="520"
+        Width="980"
+        Height="680"
+        Background="#F6F7F9">
+
+    <Grid RowDefinitions="Auto,*,Auto">
+        <Border Grid.Row="0"
+                Background="#FFFFFF"
+                BorderBrush="#D9DEE7"
+                BorderThickness="0,0,0,1"
+                Padding="20,16">
+            <Grid ColumnDefinitions="*,Auto">
+                <StackPanel Spacing="4">
+                    <TextBlock Text="STS 音声対話"
+                               FontSize="20"
+                               FontWeight="SemiBold"
+                               Foreground="#20242C" />
+                    <TextBlock x:Name="StatusText"
+                               Text="Backend未接続"
+                               FontSize="13"
+                               Foreground="#657085" />
+                </StackPanel>
+
+                <Button Grid.Column="1"
+                        x:Name="RefreshButton"
+                        Content="履歴更新"
+                        MinWidth="96"
+                        VerticalAlignment="Center"
+                        Click="RefreshButton_Click" />
+            </Grid>
+        </Border>
+
+        <ScrollViewer Grid.Row="1"
+                      x:Name="MessagesScrollViewer"
+                      Padding="20"
+                      VerticalScrollBarVisibility="Auto">
+            <!-- メッセージを明示的な縦配置領域へ追加します。 -->
+            <StackPanel x:Name="MessagesPanel" />
+        </ScrollViewer>
+
+        <Border Grid.Row="2"
+                Background="#FFFFFF"
+                BorderBrush="#D9DEE7"
+                BorderThickness="0,1,0,0"
+                Padding="20,14">
+            <Grid ColumnDefinitions="*,Auto" ColumnSpacing="16">
+                <TextBlock x:Name="InputHintText"
+                           Text="PushToTalkで話す準備ができています。"
+                           VerticalAlignment="Center"
+                           FontSize="14"
+                           TextWrapping="Wrap"
+                           MaxWidth="760"
+                           Foreground="#4C566A" />
+
+                <Button Grid.Column="1"
+                        x:Name="PushToTalkButton"
+                        Content="PushToTalk"
+                        MinWidth="132"
+                        Height="44"
+                        FontWeight="SemiBold" />
+            </Grid>
+        </Border>
+    </Grid>
+</Window>
