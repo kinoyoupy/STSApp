@@ -1,5 +1,4 @@
 using Avalonia.Controls;
-using Avalonia.Input;
 using Avalonia;
 using System;
 using System.Collections.Generic;
@@ -26,7 +25,10 @@ public partial class MainWindow : Window
     // MainWindowにすべて直接書くと見通しが悪くなるため、外部とのやり取りは小さなクラスへ逃がしています。
     private readonly BackendApiClient _backendApiClient;
     private readonly ConversationHubClient _conversationHubClient;
-    private readonly PushToTalkAudioRecorder _audioRecorder = new();
+    // マイク監視中に20ms音声フレームを受け取り、WebRTC VADへ渡す録音処理です。
+    private readonly ContinuousAudioRecorder _audioRecorder = new();
+    private readonly WebRtcVoiceActivityDetector _voiceActivityDetector = new();
+    private readonly VoiceEndpointDetector _voiceEndpointDetector = new();
     private readonly AudioPlaybackService _audioPlaybackService = new();
     private readonly Border _messageEndSpacer = CreateMessageEndSpacer();
 
@@ -38,8 +40,14 @@ public partial class MainWindow : Window
     // 音声アップロード、履歴取得、SignalR通知のフィルタリングで同じIDを使います。
     private Guid? _conversationId;
 
-    // PointerPressedが連続して呼ばれても二重録音にならないようにするフラグです。
-    private bool _isRecording;
+    // 音声入力の進行状況です。
+    // 録音中だけでなく、Backend処理中かどうかも区別して二重送信を防ぎます。
+    private VoiceInputState _voiceInputState = VoiceInputState.Ready;
+    // 音声入力開始ボタンを押してから停止ボタンを押すまでの、継続した待機状態を表します。
+    // Backend処理中でもこの値を残すことで、返答音声の再生後に待機へ戻せます。
+    private bool _voiceInputSessionEnabled;
+    // 終話検知は音声フレームごとに届くため、同じ発話を二重送信しないための保護です。
+    private bool _isCompletingDetectedUtterance;
 
     public MainWindow()
         : this(DesktopAppSettings.Load())
@@ -52,14 +60,19 @@ public partial class MainWindow : Window
 
         _backendApiClient = new BackendApiClient(settings.BackendBaseUrl);
         _conversationHubClient = new ConversationHubClient(settings.BackendBaseUrl);
+        // 待機中に届く20msフレームをVADへ渡します。
+        // 発話開始・終話が確定した時だけ、VoiceEndpointDetectorから画面側へ通知します。
+        _audioRecorder.FrameCaptured += _voiceActivityDetector.ProcessFrame;
+        _voiceActivityDetector.FrameClassified += _voiceEndpointDetector.ProcessVoiceActivity;
+        _voiceEndpointDetector.StateChanged += VoiceEndpointDetector_StateChanged;
         MessagesPanel.Children.Add(_messageEndSpacer);
         MessagesScrollViewer.LayoutUpdated += MessagesScrollViewer_LayoutUpdated;
+        ApplyVoiceInputState(VoiceInputState.Ready);
 
         AddSystemMessage("アプリを起動しました。Backendへ接続します。");
 
         // Windowが表示された後にBackend接続を始めます。
         // コンストラクタ内で待ち処理をすると、画面表示が遅くなるためです。
-        RegisterPushToTalkHandlers();
         RegisterSignalREvents();
         Opened += MainWindow_Opened;
         Closed += MainWindow_Closed;
@@ -79,7 +92,11 @@ public partial class MainWindow : Window
         _windowClosingTokenSource.Cancel();
         _windowClosingTokenSource.Dispose();
         MessagesScrollViewer.LayoutUpdated -= MessagesScrollViewer_LayoutUpdated;
+        _audioRecorder.FrameCaptured -= _voiceActivityDetector.ProcessFrame;
+        _voiceActivityDetector.FrameClassified -= _voiceEndpointDetector.ProcessVoiceActivity;
+        _voiceEndpointDetector.StateChanged -= VoiceEndpointDetector_StateChanged;
         _audioRecorder.Dispose();
+        _voiceActivityDetector.Dispose();
         _backendApiClient.Dispose();
         await _conversationHubClient.DisposeAsync();
     }
@@ -91,85 +108,158 @@ public partial class MainWindow : Window
         await RefreshConversationTurnsAsync();
     }
 
-    private void RegisterPushToTalkHandlers()
+    private void VoiceInputButton_Click(object? sender, RoutedEventArgs e)
     {
-        // AvaloniaのButtonは内部でPointerイベントを処理済みにすることがあります。
-        // AddHandler(... handledEventsToo: true) を使うと、処理済みになったイベントも受け取れます。
-        PushToTalkButton.AddHandler(
-            InputElement.PointerPressedEvent,
-            PushToTalkButton_PointerPressed,
-            RoutingStrategies.Tunnel,
-            handledEventsToo: true);
-
-        PushToTalkButton.AddHandler(
-            InputElement.PointerReleasedEvent,
-            PushToTalkButton_PointerReleased,
-            RoutingStrategies.Tunnel,
-            handledEventsToo: true);
-    }
-
-    private void PushToTalkButton_PointerPressed(object? sender, PointerPressedEventArgs e)
-    {
-        if (_isRecording)
+        if (_voiceInputState == VoiceInputState.Processing)
         {
             return;
         }
 
-        // ボタンの外で指やマウスを離しても終了イベントを拾えるように、
-        // 押下中はポインターをこのボタンに捕まえておきます。
-        e.Pointer.Capture(PushToTalkButton);
+        if (_voiceInputSessionEnabled)
+        {
+            // 停止操作は「現在進行中の発話を送らず、音声入力待機そのものを終える」意味にします。
+            // 途中まで話した内容を意図せず送信しないためです。
+            StopListeningAndDiscard();
+            return;
+        }
 
-        // PushToTalk は「押している間だけ録音」する操作です。
-        // 録音開始時点でマイク権限や入力デバイスの問題があれば、ここで分かるようにします。
+        StartListening();
+    }
+
+    private void StartListening()
+    {
         try
         {
-            _audioRecorder.Start();
-            _isRecording = true;
+            _voiceInputSessionEnabled = true;
+            _isCompletingDetectedUtterance = false;
+            _voiceActivityDetector.BeginRecording();
+            _voiceEndpointDetector.BeginRecording();
+            _audioRecorder.StartListening();
+            ApplyVoiceInputState(VoiceInputState.Listening);
+            StatusText.Text = "音声入力待機中";
+            InputHintText.Text = "話しかけてください。話し終えると自動で送信します。";
+            AddSystemMessage("音声入力の待機を開始しました。");
         }
         catch (Exception ex)
         {
-            e.Pointer.Capture(null);
-            StatusText.Text = "録音開始失敗";
+            _voiceInputSessionEnabled = false;
+            _voiceActivityDetector.EndRecording();
+            _voiceEndpointDetector.EndRecording();
+            _audioRecorder.StopAndDiscard();
+            ApplyVoiceInputState(VoiceInputState.Error);
+            StatusText.Text = "音声入力開始失敗";
             InputHintText.Text = "macOSのマイク権限、または入力デバイスの状態を確認してください。";
-            AddSystemMessage($"録音を開始できませんでした: {ex.Message}");
-            return;
+            AddSystemMessage($"音声入力の待機を開始できませんでした: {ex.Message}");
         }
-
-        InputHintText.Text = "録音中...";
-        StatusText.Text = "音声入力中";
-        AddSystemMessage("録音を開始しました。");
     }
 
-    private async void PushToTalkButton_PointerReleased(object? sender, PointerReleasedEventArgs e)
+    private void StopListeningAndDiscard()
     {
-        if (!_isRecording)
-        {
-            return;
-        }
-
-        e.Pointer.Capture(null);
-
-        _isRecording = false;
-        InputHintText.Text = "音声を送信しています...";
-        StatusText.Text = "音声送信中";
-        var shouldRefreshTurns = false;
-        RecordedAudio audio;
+        _voiceInputSessionEnabled = false;
+        _isCompletingDetectedUtterance = false;
 
         try
         {
-            // 録音停止は、Backend通信より先に必ず行います。
-            // 先に会話作成や通信を行うと、そこで失敗した時に録音デバイスが開いたまま残ってしまいます。
-            audio = _audioRecorder.Stop();
+            _audioRecorder.StopAndDiscard();
         }
-        catch (Exception)
+        catch (Exception ex)
         {
-            StatusText.Text = "録音保存失敗";
-            InputHintText.Text = "録音データを作成できませんでした。少し長めに押すか、マイク権限を確認してください。";
-            // 詳細な原因は下部の状態欄で表示します。
-            // チャット欄には短い結果だけを置き、長い例外文でカードが画面を占有しないようにします。
-            AddSystemMessage("録音データを作成できませんでした。");
+            AddSystemMessage($"音声入力を停止する際に問題が起きました: {ex.Message}");
+        }
+
+        _voiceActivityDetector.EndRecording();
+        _voiceEndpointDetector.EndRecording();
+        ApplyVoiceInputState(VoiceInputState.Ready);
+        StatusText.Text = "音声入力停止";
+        InputHintText.Text = "音声入力開始を押すと、話しかける準備ができます。";
+        AddSystemMessage("音声入力の待機を停止しました。");
+    }
+
+    private void VoiceEndpointDetector_StateChanged(VoiceEndpointState state)
+    {
+        // VADの通知はマイク用スレッドから届くため、画面と録音保存の制御はUIスレッドに戻します。
+        RunOnUiThread(() => HandleVoiceEndpointStateChanged(state));
+    }
+
+    private void HandleVoiceEndpointStateChanged(VoiceEndpointState state)
+    {
+        if (!_voiceInputSessionEnabled)
+        {
             return;
         }
+
+        if (state == VoiceEndpointState.SpeechInProgress && _voiceInputState == VoiceInputState.Listening)
+        {
+            try
+            {
+                _audioRecorder.BeginAudioCapture();
+                ApplyVoiceInputState(VoiceInputState.Recording);
+                StatusText.Text = "発話を検知しました";
+                InputHintText.Text = "話し終えると自動で送信します。";
+                AddSystemMessage("発話を検知しました。音声を保存しています。");
+            }
+            catch (Exception ex)
+            {
+                _voiceInputSessionEnabled = false;
+                _audioRecorder.StopAndDiscard();
+                _voiceActivityDetector.EndRecording();
+                _voiceEndpointDetector.EndRecording();
+                ApplyVoiceInputState(VoiceInputState.Error);
+                StatusText.Text = "録音保存開始失敗";
+                InputHintText.Text = "音声入力を開始し直してください。";
+                AddSystemMessage($"発話音声の保存を開始できませんでした: {ex.Message}");
+            }
+
+            return;
+        }
+
+        if (state == VoiceEndpointState.SpeechEnded && _voiceInputState == VoiceInputState.Recording)
+        {
+            _ = CompleteDetectedUtteranceAsync();
+        }
+    }
+
+    private async Task CompleteDetectedUtteranceAsync()
+    {
+        if (_isCompletingDetectedUtterance)
+        {
+            return;
+        }
+
+        _isCompletingDetectedUtterance = true;
+        ApplyVoiceInputState(VoiceInputState.Processing);
+        StatusText.Text = "終話を検知しました";
+        InputHintText.Text = "音声を送信しています...";
+
+        try
+        {
+            // 監視を止めてWAVを確定させてから通信します。
+            // ここを先に行うことで、次の待機中の音声が今回の発話に混ざりません。
+            var audio = _audioRecorder.StopAndGetAudio();
+            _voiceActivityDetector.EndRecording();
+            _voiceEndpointDetector.EndRecording();
+            AddSystemMessage("終話を検知し、録音音声をBackendへ送信します。");
+            await SendRecordedAudioAsync(audio);
+        }
+        catch (Exception ex)
+        {
+            _voiceInputSessionEnabled = false;
+            _voiceActivityDetector.EndRecording();
+            _voiceEndpointDetector.EndRecording();
+            ApplyVoiceInputState(VoiceInputState.Error);
+            StatusText.Text = "録音保存失敗";
+            InputHintText.Text = "音声入力を開始し直してください。";
+            AddSystemMessage($"録音データを作成できませんでした: {ex.Message}");
+        }
+        finally
+        {
+            _isCompletingDetectedUtterance = false;
+        }
+    }
+
+    private async Task SendRecordedAudioAsync(RecordedAudio audio)
+    {
+        var shouldRefreshTurns = false;
 
         try
         {
@@ -180,13 +270,11 @@ public partial class MainWindow : Window
 
             if (_conversationId is null)
             {
-                AddSystemMessage("会話セッションがないため、音声を送信できませんでした。");
-                return;
+                throw new InvalidOperationException("会話セッションがないため、音声を送信できませんでした。");
             }
 
             // 音声ファイルはRESTでBackendへ送ります。
             // 文字起こし結果やAI返答など、処理途中の変化はSignalRで別途受け取ります。
-            // ここから先はBackend側にターンが作られる可能性があるため、失敗しても履歴更新します。
             shouldRefreshTurns = true;
             await _backendApiClient.UploadAudioTurnAsync(
                 _conversationId.Value,
@@ -195,12 +283,11 @@ public partial class MainWindow : Window
 
             StatusText.Text = "音声送信完了";
             InputHintText.Text = "Backendへ音声を送信しました。";
-            AddSystemMessage("録音音声をBackendへ送信しました。");
         }
         catch (Exception ex)
         {
-            // STT APIが未設定の場合、Backendは502を返します。
-            // その場合もBackend側には失敗ターンが保存されるため、履歴更新で確認できます。
+            _voiceInputSessionEnabled = false;
+            ApplyVoiceInputState(VoiceInputState.Error);
             StatusText.Text = "Backend処理失敗";
             InputHintText.Text = shouldRefreshTurns
                 ? "履歴更新でBackend側の状態を確認できます。"
@@ -227,7 +314,7 @@ public partial class MainWindow : Window
                 _windowClosingTokenSource.Token);
 
             StatusText.Text = $"Backend接続済み / Conversation: {_conversationId}";
-            InputHintText.Text = "PushToTalkで話す準備ができています。";
+            InputHintText.Text = "音声入力開始を押すと、話しかける準備ができます。";
             AddSystemMessage("Backendに会話セッションを作成しました。");
         }
         catch (Exception ex)
@@ -321,6 +408,8 @@ public partial class MainWindow : Window
                 }
 
                 AddSystemMessage($"処理に失敗しました: {FormatStage(value.Stage)} / {value.Message}");
+                _voiceInputSessionEnabled = false;
+                ApplyVoiceInputState(VoiceInputState.Error);
                 StatusText.Text = "処理失敗";
                 InputHintText.Text = "履歴更新でBackend側の状態を確認できます。";
             });
@@ -366,11 +455,22 @@ public partial class MainWindow : Window
                 audioBytes,
                 _windowClosingTokenSource.Token);
 
-            StatusText.Text = "返答音声再生完了";
-            InputHintText.Text = "PushToTalkで次の発話ができます。";
+            if (_voiceInputSessionEnabled)
+            {
+                // 1回の開始操作で次の発話も受け付けるため、返答の再生後は待機へ戻します。
+                StartListening();
+            }
+            else
+            {
+                StatusText.Text = "返答音声再生完了";
+                InputHintText.Text = "音声入力開始を押すと、話しかける準備ができます。";
+                ApplyVoiceInputState(VoiceInputState.Ready);
+            }
         }
         catch (Exception ex)
         {
+            _voiceInputSessionEnabled = false;
+            ApplyVoiceInputState(VoiceInputState.Error);
             StatusText.Text = "返答音声再生失敗";
             InputHintText.Text = "音声ファイルを取得または再生できませんでした。";
             AddSystemMessage($"返答音声を再生できませんでした: {ex.Message}");
@@ -530,6 +630,22 @@ public partial class MainWindow : Window
     {
         StatusText.Text = text;
         InputHintText.Text = text;
+    }
+
+    private void ApplyVoiceInputState(VoiceInputState state)
+    {
+        _voiceInputState = state;
+
+        // Backend処理中だけは停止・開始を受け付けません。
+        // 処理中にマイクを開くと、どの発話への返答かが混ざってしまうためです。
+        VoiceInputButton.IsEnabled = state != VoiceInputState.Processing;
+
+        VoiceInputButton.Content = state switch
+        {
+            VoiceInputState.Listening or VoiceInputState.Recording => "音声入力停止",
+            VoiceInputState.Processing => "処理中...",
+            _ => "音声入力開始"
+        };
     }
 
     private void AddUserMessage(string text, Guid? turnId = null)
