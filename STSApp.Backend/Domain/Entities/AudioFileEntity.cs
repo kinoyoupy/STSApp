@@ -13,7 +13,6 @@ public sealed class AudioFileEntity
     public AudioFileKind Kind { get; init; }
     public string FilePath { get; init; } = string.Empty;
     public string MimeType { get; init; } = string.Empty;
-    public int? DurationMs { get; init; }
     public long? FileSizeBytes { get; init; }
     public DateTime CreatedAt { get; init; }
 }

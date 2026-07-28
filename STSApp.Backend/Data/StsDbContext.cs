@@ -152,9 +152,6 @@ public sealed class StsDbContext : DbContext
                 .HasMaxLength(100)
                 .IsRequired();
 
-            entity.Property(x => x.DurationMs)
-                .HasColumnName("duration_ms");
-
             entity.Property(x => x.FileSizeBytes)
                 .HasColumnName("file_size_bytes");
 

@@ -269,7 +269,6 @@ public sealed class ConversationRepository : IConversationRepository
             entity.Kind,
             entity.FilePath,
             entity.MimeType,
-            entity.DurationMs,
             entity.FileSizeBytes,
             entity.CreatedAt);
     }
