@@ -54,7 +54,7 @@
                 Padding="20,14">
             <Grid ColumnDefinitions="*,Auto" ColumnSpacing="16">
                 <TextBlock x:Name="InputHintText"
-                           Text="PushToTalkで話す準備ができています。"
+                           Text="音声入力開始を押すと、話しかける準備ができます。"
                            VerticalAlignment="Center"
                            FontSize="14"
                            TextWrapping="Wrap"
@@ -62,11 +62,12 @@
                            Foreground="#4C566A" />
 
                 <Button Grid.Column="1"
-                        x:Name="PushToTalkButton"
-                        Content="PushToTalk"
+                        x:Name="VoiceInputButton"
+                        Content="音声入力開始"
                         MinWidth="132"
                         Height="44"
-                        FontWeight="SemiBold" />
+                        FontWeight="SemiBold"
+                        Click="VoiceInputButton_Click" />
             </Grid>
         </Border>
     </Grid>

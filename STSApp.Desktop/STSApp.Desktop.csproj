@@ -12,6 +12,7 @@
     <PackageReference Include="Avalonia.Themes.Fluent" Version="12.1.0" />
     <PackageReference Include="Avalonia.Fonts.Inter" Version="12.1.0" />
     <PackageReference Include="Microsoft.AspNetCore.SignalR.Client" Version="10.0.10" />
+    <PackageReference Include="WebRtcVad.NET" Version="1.0.0" />
   </ItemGroup>
 
   <ItemGroup>
@@ -30,6 +31,6 @@
     現在の実行環境はmacOSなので、Unix環境でだけ実行します。
   -->
   <Target Name="BuildMacAudioBridge" BeforeTargets="Build" Condition="'$(OS)' == 'Unix'">
-    <Exec Command="mkdir -p &quot;$(OutputPath)&quot; &amp;&amp; clang -fobjc-arc -dynamiclib -framework Foundation -framework AVFoundation &quot;$(MSBuildProjectDirectory)/Native/MacAudioRecorder.m&quot; -o &quot;$(OutputPath)libsts_audio_recorder.dylib&quot;" />
+    <Exec Command="mkdir -p &quot;$(OutputPath)&quot; &amp;&amp; clang -fobjc-arc -dynamiclib -framework Foundation -framework AVFoundation &quot;$(MSBuildProjectDirectory)/Native/MacAudioRecorder.m&quot; &quot;$(MSBuildProjectDirectory)/Native/MacContinuousAudioRecorder.m&quot; -o &quot;$(OutputPath)libsts_audio_recorder.dylib&quot;" />
   </Target>
 </Project>
