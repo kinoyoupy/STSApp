@@ -46,9 +46,10 @@ public sealed class HttpSttClient : ISttClient
         using var response = await _httpClient.SendAsync(request, cancellationToken);
         if (!response.IsSuccessStatusCode)
         {
-            var body = await response.Content.ReadAsStringAsync(cancellationToken);
+            // 外部APIのエラー本文には、送信した音声の認識結果や診断情報が含まれる可能性があります。
+            // 例外はログとturn_eventsにも渡るため、本文を含めずHTTP状態コードだけを記録します。
             throw new InvalidOperationException(
-                $"STT API request failed. StatusCode={(int)response.StatusCode}, Body={body}");
+                $"STT API request failed. StatusCode={(int)response.StatusCode}.");
         }
 
         var result = await response.Content.ReadFromJsonAsync<SttResponse>(cancellationToken);

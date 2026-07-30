@@ -6,8 +6,5 @@ namespace STSApp.Backend.Services.External;
 /// </summary>
 public interface IGeminiClient
 {
-    Task<string> GenerateReplyAsync(
-        string userText,
-        IReadOnlyList<(string UserText, string AssistantText)> recentTurns,
-        CancellationToken cancellationToken);
+    Task<string> GenerateReplyAsync(GeminiReplyRequest request, CancellationToken cancellationToken);
 }

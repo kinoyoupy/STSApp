@@ -1,3 +1,5 @@
+using STSApp.Contracts.Enums;
+
 namespace STSApp.Contracts.Events;
 
 /// <summary>
@@ -6,4 +8,5 @@ namespace STSApp.Contracts.Events;
 public sealed record AssistantTextCompletedEvent(
     Guid ConversationId,
     Guid TurnId,
-    string AssistantText);
+    string AssistantText,
+    AnswerBasis AnswerBasis);

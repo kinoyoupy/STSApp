@@ -6,10 +6,7 @@ namespace STSApp.Backend.Services.External;
 /// </summary>
 public sealed class NotConfiguredGeminiClient : IGeminiClient
 {
-    public Task<string> GenerateReplyAsync(
-        string userText,
-        IReadOnlyList<(string UserText, string AssistantText)> recentTurns,
-        CancellationToken cancellationToken)
+    public Task<string> GenerateReplyAsync(GeminiReplyRequest request, CancellationToken cancellationToken)
     {
         throw new NotImplementedException("Gemini API settings are not configured yet.");
     }

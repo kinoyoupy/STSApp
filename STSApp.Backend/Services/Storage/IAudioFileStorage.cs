@@ -18,6 +18,10 @@ public interface IAudioFileStorage
         string fileExtension,
         CancellationToken cancellationToken);
 
+    Task DeleteAsync(
+        string filePath,
+        CancellationToken cancellationToken);
+
     Task<Stream?> OpenReadAsync(
         string filePath,
         CancellationToken cancellationToken);

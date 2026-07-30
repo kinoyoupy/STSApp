@@ -25,7 +25,7 @@ public enum VoiceInputState
     Recording,
 
     /// <summary>
-    /// 録音済み音声をBackendがSTT、Gemini、TTSの順で処理している状態です。
+    /// 録音済み音声をBackendがSTT、RAG、Gemini、TTSの順で処理している状態です。
     /// 処理中に新しい音声を受け付けると会話の順序が混ざるため、録音開始を受け付けません。
     /// </summary>
     Processing,

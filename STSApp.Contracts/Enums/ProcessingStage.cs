@@ -8,6 +8,7 @@ public enum ProcessingStage
 {
     Upload,
     Stt,
+    Rag,
     Gemini,
     Tts,
     Database

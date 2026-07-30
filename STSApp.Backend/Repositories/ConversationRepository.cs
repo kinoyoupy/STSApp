@@ -49,6 +49,17 @@ public sealed class ConversationRepository : IConversationRepository
         return conversations.Select(ToDto).ToList();
     }
 
+    public Task<bool> ConversationExistsAsync(
+        Guid conversationId,
+        CancellationToken cancellationToken)
+    {
+        // 履歴取得や音声送信の前に存在確認できるようにします。
+        // 外部キー違反まで処理を進めると、入力ミスとDB障害を区別できなくなるためです。
+        return _dbContext.Conversations
+            .AsNoTracking()
+            .AnyAsync(x => x.Id == conversationId, cancellationToken);
+    }
+
     public async Task<IReadOnlyList<ConversationTurnDto>> ListConversationTurnsAsync(
         Guid conversationId,
         CancellationToken cancellationToken)
@@ -66,7 +77,7 @@ public sealed class ConversationRepository : IConversationRepository
         Guid conversationId,
         CancellationToken cancellationToken)
     {
-        // 音声アップロード直後は、まだSTT/Gemini/TTSが終わっていません。
+        // 音声アップロード直後は、まだSTT/RAG/Gemini/TTSが終わっていません。
         // そのため、まずProcessing状態のターンを作り、後続処理で内容を埋めていきます。
         var now = DateTime.UtcNow;
         var turn = new ConversationTurnEntity
@@ -77,6 +88,12 @@ public sealed class ConversationRepository : IConversationRepository
             CreatedAt = now,
             UpdatedAt = now
         };
+
+        // 会話一覧はconversations.updated_atの新しい順に取得します。
+        // ターン開始を会話の利用時刻として同時に更新し、最近使った会話が一覧上部へ来るようにします。
+        var conversation = await _dbContext.Conversations
+            .FirstAsync(x => x.Id == conversationId, cancellationToken);
+        conversation.UpdatedAt = now;
 
         _dbContext.ConversationTurns.Add(turn);
         await _dbContext.SaveChangesAsync(cancellationToken);
@@ -163,12 +180,14 @@ public sealed class ConversationRepository : IConversationRepository
     public async Task UpdateAssistantTextAsync(
         Guid turnId,
         string assistantText,
+        AnswerBasis answerBasis,
         CancellationToken cancellationToken)
     {
         var turn = await _dbContext.ConversationTurns
             .FirstAsync(x => x.Id == turnId, cancellationToken);
 
         turn.AssistantText = assistantText;
+        turn.AnswerBasis = answerBasis;
         turn.UpdatedAt = DateTime.UtcNow;
 
         await _dbContext.SaveChangesAsync(cancellationToken);
@@ -254,6 +273,7 @@ public sealed class ConversationRepository : IConversationRepository
             entity.ConversationId,
             entity.UserText,
             entity.AssistantText,
+            entity.AnswerBasis,
             entity.Status,
             entity.ErrorStage,
             entity.ErrorMessage,

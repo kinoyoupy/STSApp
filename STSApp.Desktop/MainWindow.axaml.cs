@@ -1,36 +1,32 @@
 using Avalonia.Controls;
-using Avalonia;
 using System;
-using System.Collections.Generic;
-using System.Collections.ObjectModel;
-using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Avalonia.Interactivity;
 using Avalonia.Threading;
 using STSApp.Contracts.Enums;
 using STSApp.Contracts.Events;
-using STSApp.Contracts.Models;
+using System.Collections.Generic;
+using System.Linq;
 
 namespace STSApp.Desktop;
 
 public partial class MainWindow : Window
 {
-    // ObservableCollection は、会話履歴をアプリ内部で保持するためのコレクションです。
-    // 現在の画面はMessagesPanelへカードを明示的に追加する構成のため、
-    // 画面への反映はAddMessageToPanelなどの処理が担当します。
-    private readonly ObservableCollection<ChatMessageItem> _messages = new();
-
     // REST API、SignalR、録音、音声再生は役割を分けています。
     // MainWindowにすべて直接書くと見通しが悪くなるため、外部とのやり取りは小さなクラスへ逃がしています。
     private readonly BackendApiClient _backendApiClient;
     private readonly ConversationHubClient _conversationHubClient;
-    // マイク監視中に20ms音声フレームを受け取り、WebRTC VADへ渡す録音処理です。
-    private readonly ContinuousAudioRecorder _audioRecorder = new();
-    private readonly WebRtcVoiceActivityDetector _voiceActivityDetector = new();
-    private readonly VoiceEndpointDetector _voiceEndpointDetector = new();
+    private readonly VoiceInputSessionController _voiceInputController = new();
     private readonly AudioPlaybackService _audioPlaybackService = new();
-    private readonly Border _messageEndSpacer = CreateMessageEndSpacer();
+    private readonly ChatMessageListController _chatMessages;
+    // SignalR通知とREST完了応答の両方から同じ音声IDが届くため、再生済みIDを覚えて二重再生を防ぎます。
+    private readonly HashSet<Guid> _completedAudioPlaybackIds = [];
+    private readonly Dictionary<Guid, Task<bool>> _activeAudioPlaybackTasks = [];
+    private readonly HashSet<Guid> _observedTurnIds = [];
+    // 起動処理と履歴更新が同時に会話を作ろうとしても、作成APIは1本ずつ実行します。
+    // 1画面で2つの会話IDが競合し、通知先と保存先が分かれることを防ぐためです。
+    private readonly SemaphoreSlim _conversationCreationGate = new(1, 1);
 
     // Windowを閉じた時に、実行中のHTTP通信やSignalR接続へキャンセルを伝えるためのものです。
     // 非同期処理が画面破棄後も残ると、例外や不要な通信の原因になります。
@@ -39,15 +35,7 @@ public partial class MainWindow : Window
     // Backendで作られた会話セッションIDです。
     // 音声アップロード、履歴取得、SignalR通知のフィルタリングで同じIDを使います。
     private Guid? _conversationId;
-
-    // 音声入力の進行状況です。
-    // 録音中だけでなく、Backend処理中かどうかも区別して二重送信を防ぎます。
-    private VoiceInputState _voiceInputState = VoiceInputState.Ready;
-    // 音声入力開始ボタンを押してから停止ボタンを押すまでの、継続した待機状態を表します。
-    // Backend処理中でもこの値を残すことで、返答音声の再生後に待機へ戻せます。
-    private bool _voiceInputSessionEnabled;
-    // 終話検知は音声フレームごとに届くため、同じ発話を二重送信しないための保護です。
-    private bool _isCompletingDetectedUtterance;
+    private bool _isBackendReady;
 
     public MainWindow()
         : this(DesktopAppSettings.Load())
@@ -60,16 +48,14 @@ public partial class MainWindow : Window
 
         _backendApiClient = new BackendApiClient(settings.BackendBaseUrl);
         _conversationHubClient = new ConversationHubClient(settings.BackendBaseUrl);
-        // 待機中に届く20msフレームをVADへ渡します。
-        // 発話開始・終話が確定した時だけ、VoiceEndpointDetectorから画面側へ通知します。
-        _audioRecorder.FrameCaptured += _voiceActivityDetector.ProcessFrame;
-        _voiceActivityDetector.FrameClassified += _voiceEndpointDetector.ProcessVoiceActivity;
-        _voiceEndpointDetector.StateChanged += VoiceEndpointDetector_StateChanged;
-        MessagesPanel.Children.Add(_messageEndSpacer);
-        MessagesScrollViewer.LayoutUpdated += MessagesScrollViewer_LayoutUpdated;
+        _chatMessages = new ChatMessageListController(
+            MessagesPanel,
+            MessagesScrollViewer);
+        _voiceInputController.StateChanged += ApplyVoiceInputState;
+        _voiceInputController.ActivityChanged += VoiceInputController_ActivityChanged;
+        _voiceInputController.AudioReady += VoiceInputController_AudioReady;
+        _voiceInputController.ErrorOccurred += VoiceInputController_ErrorOccurred;
         ApplyVoiceInputState(VoiceInputState.Ready);
-
-        AddSystemMessage("アプリを起動しました。Backendへ接続します。");
 
         // Windowが表示された後にBackend接続を始めます。
         // コンストラクタ内で待ち処理をすると、画面表示が遅くなるためです。
@@ -91,12 +77,12 @@ public partial class MainWindow : Window
         // 画面が閉じられた後にHTTP通信が続かないよう、キャンセルします。
         _windowClosingTokenSource.Cancel();
         _windowClosingTokenSource.Dispose();
-        MessagesScrollViewer.LayoutUpdated -= MessagesScrollViewer_LayoutUpdated;
-        _audioRecorder.FrameCaptured -= _voiceActivityDetector.ProcessFrame;
-        _voiceActivityDetector.FrameClassified -= _voiceEndpointDetector.ProcessVoiceActivity;
-        _voiceEndpointDetector.StateChanged -= VoiceEndpointDetector_StateChanged;
-        _audioRecorder.Dispose();
-        _voiceActivityDetector.Dispose();
+        _chatMessages.Dispose();
+        _voiceInputController.StateChanged -= ApplyVoiceInputState;
+        _voiceInputController.ActivityChanged -= VoiceInputController_ActivityChanged;
+        _voiceInputController.AudioReady -= VoiceInputController_AudioReady;
+        _voiceInputController.ErrorOccurred -= VoiceInputController_ErrorOccurred;
+        _voiceInputController.Dispose();
         _backendApiClient.Dispose();
         await _conversationHubClient.DisposeAsync();
     }
@@ -110,156 +96,82 @@ public partial class MainWindow : Window
 
     private void VoiceInputButton_Click(object? sender, RoutedEventArgs e)
     {
-        if (_voiceInputState == VoiceInputState.Processing)
+        if (_voiceInputController.State == VoiceInputState.Processing)
         {
             return;
         }
 
-        if (_voiceInputSessionEnabled)
+        if (_voiceInputController.SessionEnabled)
         {
-            // 停止操作は「現在進行中の発話を送らず、音声入力待機そのものを終える」意味にします。
-            // 途中まで話した内容を意図せず送信しないためです。
-            StopListeningAndDiscard();
+            _voiceInputController.StopSessionAndDiscard();
             return;
         }
 
-        StartListening();
+        _voiceInputController.StartSession();
     }
 
-    private void StartListening()
+    private void VoiceInputController_ActivityChanged(VoiceInputSessionActivity activity)
     {
-        try
+        switch (activity)
         {
-            _voiceInputSessionEnabled = true;
-            _isCompletingDetectedUtterance = false;
-            _voiceActivityDetector.BeginRecording();
-            _voiceEndpointDetector.BeginRecording();
-            _audioRecorder.StartListening();
-            ApplyVoiceInputState(VoiceInputState.Listening);
-            StatusText.Text = "音声入力待機中";
-            InputHintText.Text = "話しかけてください。話し終えると自動で送信します。";
-            AddSystemMessage("音声入力の待機を開始しました。");
-        }
-        catch (Exception ex)
-        {
-            _voiceInputSessionEnabled = false;
-            _voiceActivityDetector.EndRecording();
-            _voiceEndpointDetector.EndRecording();
-            _audioRecorder.StopAndDiscard();
-            ApplyVoiceInputState(VoiceInputState.Error);
-            StatusText.Text = "音声入力開始失敗";
-            InputHintText.Text = "macOSのマイク権限、または入力デバイスの状態を確認してください。";
-            AddSystemMessage($"音声入力の待機を開始できませんでした: {ex.Message}");
-        }
-    }
-
-    private void StopListeningAndDiscard()
-    {
-        _voiceInputSessionEnabled = false;
-        _isCompletingDetectedUtterance = false;
-
-        try
-        {
-            _audioRecorder.StopAndDiscard();
-        }
-        catch (Exception ex)
-        {
-            AddSystemMessage($"音声入力を停止する際に問題が起きました: {ex.Message}");
-        }
-
-        _voiceActivityDetector.EndRecording();
-        _voiceEndpointDetector.EndRecording();
-        ApplyVoiceInputState(VoiceInputState.Ready);
-        StatusText.Text = "音声入力停止";
-        InputHintText.Text = "音声入力開始を押すと、話しかける準備ができます。";
-        AddSystemMessage("音声入力の待機を停止しました。");
-    }
-
-    private void VoiceEndpointDetector_StateChanged(VoiceEndpointState state)
-    {
-        // VADの通知はマイク用スレッドから届くため、画面と録音保存の制御はUIスレッドに戻します。
-        RunOnUiThread(() => HandleVoiceEndpointStateChanged(state));
-    }
-
-    private void HandleVoiceEndpointStateChanged(VoiceEndpointState state)
-    {
-        if (!_voiceInputSessionEnabled)
-        {
-            return;
-        }
-
-        if (state == VoiceEndpointState.SpeechInProgress && _voiceInputState == VoiceInputState.Listening)
-        {
-            try
-            {
-                _audioRecorder.BeginAudioCapture();
-                ApplyVoiceInputState(VoiceInputState.Recording);
+            case VoiceInputSessionActivity.ListeningStarted:
+                StatusText.Text = "音声入力待機中";
+                InputHintText.Text = "話しかけてください。話し終えると自動で送信します。";
+                break;
+            case VoiceInputSessionActivity.SpeechStarted:
                 StatusText.Text = "発話を検知しました";
                 InputHintText.Text = "話し終えると自動で送信します。";
-                AddSystemMessage("発話を検知しました。音声を保存しています。");
-            }
-            catch (Exception ex)
-            {
-                _voiceInputSessionEnabled = false;
-                _audioRecorder.StopAndDiscard();
-                _voiceActivityDetector.EndRecording();
-                _voiceEndpointDetector.EndRecording();
-                ApplyVoiceInputState(VoiceInputState.Error);
-                StatusText.Text = "録音保存開始失敗";
-                InputHintText.Text = "音声入力を開始し直してください。";
-                AddSystemMessage($"発話音声の保存を開始できませんでした: {ex.Message}");
-            }
-
-            return;
-        }
-
-        if (state == VoiceEndpointState.SpeechEnded && _voiceInputState == VoiceInputState.Recording)
-        {
-            _ = CompleteDetectedUtteranceAsync();
+                break;
+            case VoiceInputSessionActivity.SpeechEnded:
+                StatusText.Text = "終話を検知しました";
+                InputHintText.Text = "音声を送信しています...";
+                break;
+            case VoiceInputSessionActivity.ListeningStopped:
+                StatusText.Text = "音声入力停止";
+                InputHintText.Text = "音声入力開始を押すと、話しかける準備ができます。";
+                break;
         }
     }
 
-    private async Task CompleteDetectedUtteranceAsync()
+    private void VoiceInputController_AudioReady(RecordedAudio audio)
     {
-        if (_isCompletingDetectedUtterance)
+        _ = SendRecordedAudioAsync(audio);
+    }
+
+    private void VoiceInputController_ErrorOccurred(VoiceInputSessionError error)
+    {
+        if (error.Kind == VoiceInputSessionErrorKind.Stop)
         {
+            AddErrorMessage($"音声入力を停止する際に問題が起きました: {error.Message}");
             return;
         }
 
-        _isCompletingDetectedUtterance = true;
-        ApplyVoiceInputState(VoiceInputState.Processing);
-        StatusText.Text = "終話を検知しました";
-        InputHintText.Text = "音声を送信しています...";
-
-        try
+        switch (error.Kind)
         {
-            // 監視を止めてWAVを確定させてから通信します。
-            // ここを先に行うことで、次の待機中の音声が今回の発話に混ざりません。
-            var audio = _audioRecorder.StopAndGetAudio();
-            _voiceActivityDetector.EndRecording();
-            _voiceEndpointDetector.EndRecording();
-            AddSystemMessage("終話を検知し、録音音声をBackendへ送信します。");
-            await SendRecordedAudioAsync(audio);
-        }
-        catch (Exception ex)
-        {
-            _voiceInputSessionEnabled = false;
-            _voiceActivityDetector.EndRecording();
-            _voiceEndpointDetector.EndRecording();
-            ApplyVoiceInputState(VoiceInputState.Error);
-            StatusText.Text = "録音保存失敗";
-            InputHintText.Text = "音声入力を開始し直してください。";
-            AddSystemMessage($"録音データを作成できませんでした: {ex.Message}");
-        }
-        finally
-        {
-            _isCompletingDetectedUtterance = false;
+            case VoiceInputSessionErrorKind.Start:
+                StatusText.Text = "音声入力開始失敗";
+                InputHintText.Text = "macOSのマイク権限、または入力デバイスの状態を確認してください。";
+                AddErrorMessage($"音声入力の待機を開始できませんでした: {error.Message}");
+                break;
+            case VoiceInputSessionErrorKind.CaptureStart:
+                StatusText.Text = "録音保存開始失敗";
+                InputHintText.Text = "音声入力を開始し直してください。";
+                AddErrorMessage($"発話音声の保存を開始できませんでした: {error.Message}");
+                break;
+            case VoiceInputSessionErrorKind.Finalize:
+                StatusText.Text = "録音保存失敗";
+                InputHintText.Text = "音声入力を開始し直してください。";
+                AddErrorMessage($"録音データを作成できませんでした: {error.Message}");
+                break;
         }
     }
 
     private async Task SendRecordedAudioAsync(RecordedAudio audio)
     {
-        var shouldRefreshTurns = false;
+        var uploadWasAttempted = false;
+        // 送信前から存在していたターンと、今回Backendが新しく作ったターンを区別します。
+        // 単に履歴に失敗があるかを見るだけでは、過去の失敗を今回の失敗と誤認するためです。
+        var turnIdsBeforeUpload = _observedTurnIds.ToHashSet();
 
         try
         {
@@ -273,31 +185,43 @@ public partial class MainWindow : Window
                 throw new InvalidOperationException("会話セッションがないため、音声を送信できませんでした。");
             }
 
+            // 起動時にSignalR接続へ失敗していても、発話のたびに再接続とグループ参加を試します。
+            // ここで失敗してもRESTの音声処理と、完了後の履歴・音声取得は続けられます。
+            await TryJoinConversationNotificationsAsync(_conversationId.Value);
+
             // 音声ファイルはRESTでBackendへ送ります。
             // 文字起こし結果やAI返答など、処理途中の変化はSignalRで別途受け取ります。
-            shouldRefreshTurns = true;
-            await _backendApiClient.UploadAudioTurnAsync(
+            uploadWasAttempted = true;
+            var result = await _backendApiClient.UploadAudioTurnAsync(
                 _conversationId.Value,
                 audio,
                 _windowClosingTokenSource.Token);
 
             StatusText.Text = "音声送信完了";
             InputHintText.Text = "Backendへ音声を送信しました。";
+
+            // SignalRを取り逃した場合、チャット本文はDB履歴から、返答音声はREST応答のIDから復元します。
+            // 先に履歴を表示してから再生することで、「テキストだけ先に表示」の順序も維持します。
+            await RefreshConversationTurnsAsync();
+            await PlayAudioOnceAsync(result.OutputAudioId);
         }
         catch (Exception ex)
         {
-            _voiceInputSessionEnabled = false;
-            ApplyVoiceInputState(VoiceInputState.Error);
+            _voiceInputController.SetExternalFailure();
             StatusText.Text = "Backend処理失敗";
-            InputHintText.Text = shouldRefreshTurns
+            InputHintText.Text = uploadWasAttempted
                 ? "履歴更新でBackend側の状態を確認できます。"
                 : "Backendへ音声を送信できませんでした。";
-            AddSystemMessage($"Backendで音声処理に失敗しました: {ex.Message}");
-        }
 
-        if (shouldRefreshTurns)
-        {
-            await RefreshConversationTurnsAsync();
+            var backendFailureWasStored = uploadWasAttempted
+                && await TryRefreshTurnsAfterUploadFailureAsync(turnIdsBeforeUpload);
+
+            // Backendが新しい失敗ターンを保存できた場合は、そのDBエラーを表示します。
+            // 通信切断などでターン自体が作られなかった場合だけ、Desktop側の通信エラーを残します。
+            if (!backendFailureWasStored)
+            {
+                AddErrorMessage($"Backendへ音声を送信できませんでした: {ex.Message}");
+            }
         }
     }
 
@@ -305,6 +229,24 @@ public partial class MainWindow : Window
     {
         try
         {
+            await _conversationCreationGate.WaitAsync(_windowClosingTokenSource.Token);
+        }
+        catch (OperationCanceledException) when (_windowClosingTokenSource.IsCancellationRequested)
+        {
+            // 画面終了中は新しい会話を作る必要がありません。
+            // 直列化待ちのキャンセルを終了時エラーとして画面へ返さず、そのまま処理を終えます。
+            return;
+        }
+
+        try
+        {
+            if (_conversationId is not null)
+            {
+                _isBackendReady = true;
+                ApplyVoiceInputState(_voiceInputController.State);
+                return;
+            }
+
             SetBusyState("Backend接続中...");
 
             // このアプリでは認証がないため、起動時に新しい会話セッションを作成します。
@@ -313,15 +255,42 @@ public partial class MainWindow : Window
                 "Avalonia音声対話",
                 _windowClosingTokenSource.Token);
 
+            await TryJoinConversationNotificationsAsync(_conversationId.Value);
+
+            _isBackendReady = true;
+            ApplyVoiceInputState(_voiceInputController.State);
             StatusText.Text = $"Backend接続済み / Conversation: {_conversationId}";
             InputHintText.Text = "音声入力開始を押すと、話しかける準備ができます。";
-            AddSystemMessage("Backendに会話セッションを作成しました。");
         }
         catch (Exception ex)
         {
+            _isBackendReady = false;
+            ApplyVoiceInputState(_voiceInputController.State);
             StatusText.Text = "Backend接続失敗";
             InputHintText.Text = "Backendを起動してから履歴更新を押してください。";
-            AddSystemMessage($"Backendへ接続できませんでした: {ex.Message}");
+            AddErrorMessage($"Backendへ接続できませんでした: {ex.Message}");
+        }
+        finally
+        {
+            _conversationCreationGate.Release();
+        }
+    }
+
+    private async Task TryJoinConversationNotificationsAsync(Guid conversationId)
+    {
+        try
+        {
+            // BackendのSignalR通知は会話単位のグループへ送られます。
+            // 接続が切れた後も現在の会話へ入り直し、途中経過を再び受け取れるようにします。
+            await _conversationHubClient.JoinConversationAsync(
+                conversationId,
+                _windowClosingTokenSource.Token);
+        }
+        catch (Exception ex)
+        {
+            // SignalRは途中経過の通知経路です。RESTが利用できる時まで音声対話を止める必要はありません。
+            // 完了結果は音声送信のREST応答と履歴取得から復元します。
+            AddErrorMessage($"リアルタイム通知へ接続できませんでした: {ex.Message}");
         }
     }
 
@@ -334,11 +303,10 @@ public partial class MainWindow : Window
             // SignalRはBackendからAvaloniaへ「今どの処理中か」を届けるための接続です。
             // RESTのようにAvaloniaから毎回問い合わせるのではなく、Backend側から通知が届きます。
             await _conversationHubClient.StartAsync(_windowClosingTokenSource.Token);
-            AddSystemMessage("SignalRに接続しました。処理状態をリアルタイムに受け取れます。");
         }
         catch (Exception ex)
         {
-            AddSystemMessage($"SignalRへ接続できませんでした: {ex.Message}");
+            AddErrorMessage($"SignalRへ接続できませんでした: {ex.Message}");
         }
     }
 
@@ -360,6 +328,7 @@ public partial class MainWindow : Window
                     return;
                 }
 
+                _observedTurnIds.Add(value.TurnId);
                 AddUserMessage(value.UserText, value.TurnId);
                 StatusText.Text = "文字起こし完了";
                 InputHintText.Text = "AI返答を生成しています。";
@@ -375,7 +344,8 @@ public partial class MainWindow : Window
                     return;
                 }
 
-                AddAssistantMessage(value.AssistantText, value.TurnId);
+                _observedTurnIds.Add(value.TurnId);
+                AddAssistantMessage(value.AssistantText, value.TurnId, value.AnswerBasis);
                 StatusText.Text = "AI返答テキスト生成完了";
                 InputHintText.Text = "返答音声を生成しています。";
             });
@@ -390,11 +360,11 @@ public partial class MainWindow : Window
                     return;
                 }
 
-                AddSystemMessage($"返答音声の生成が完了しました。AudioId: {value.AudioId}");
+                _observedTurnIds.Add(value.TurnId);
                 StatusText.Text = "返答音声生成完了";
                 InputHintText.Text = "返答音声を再生しています。";
 
-                await DownloadAndPlayAudioAsync(value.AudioId);
+                await PlayAudioOnceAsync(value.AudioId);
             });
         };
 
@@ -407,9 +377,11 @@ public partial class MainWindow : Window
                     return;
                 }
 
-                AddSystemMessage($"処理に失敗しました: {FormatStage(value.Stage)} / {value.Message}");
-                _voiceInputSessionEnabled = false;
-                ApplyVoiceInputState(VoiceInputState.Error);
+                _observedTurnIds.Add(value.TurnId);
+                AddErrorMessage(
+                    $"{FormatStage(value.Stage)} / {value.Message}",
+                    value.TurnId);
+                _voiceInputController.SetExternalFailure();
                 StatusText.Text = "処理失敗";
                 InputHintText.Text = "履歴更新でBackend側の状態を確認できます。";
             });
@@ -423,8 +395,9 @@ public partial class MainWindow : Window
             return;
         }
 
-        // Backendは upload / stt / gemini / tts のような細かい状態を通知します。
-        // 初期UIではその詳細をシステムメッセージとして見せ、動作確認しやすくしています。
+        _observedTurnIds.Add(value.TurnId);
+        // Backendは upload / stt / rag / gemini / tts のような細かい状態を通知します。
+        // 途中経過をチャット履歴へ混ぜると履歴更新時に消えて見えるため、現在状態の表示だけを更新します。
         var stageText = FormatStage(value.Stage);
         var eventText = FormatEventType(value.EventType);
         var message = string.IsNullOrWhiteSpace(value.Message)
@@ -435,52 +408,100 @@ public partial class MainWindow : Window
         InputHintText.Text = stageText switch
         {
             "STT" => "音声を文字起こししています。",
+            "RAG" => "関連資料を検索しています。",
             "Gemini" => "AI返答を生成しています。",
             "TTS" => "返答音声を生成しています。",
             _ => message
         };
 
-        AddSystemMessage(message);
     }
 
-    private async Task DownloadAndPlayAudioAsync(Guid audioId)
+    private async Task<bool> DownloadAndPlayAudioWithRetryAsync(Guid audioId)
     {
-        try
+        Exception? lastException = null;
+
+        // SignalRとRESTのどちらが先に届いても、同じ共有Taskを待ちます。
+        // 一時的な取得失敗で音声を永久に失わないよう、画面に再生ボタンを戻さず1回だけ自動再試行します。
+        for (var attempt = 1; attempt <= 2; attempt++)
         {
-            var audioBytes = await _backendApiClient.DownloadAudioAsync(
-                audioId,
-                _windowClosingTokenSource.Token);
-
-            await _audioPlaybackService.PlayWavAsync(
-                audioBytes,
-                _windowClosingTokenSource.Token);
-
-            if (_voiceInputSessionEnabled)
+            try
             {
-                // 1回の開始操作で次の発話も受け付けるため、返答の再生後は待機へ戻します。
-                StartListening();
+                var audioBytes = await _backendApiClient.DownloadAudioAsync(
+                    audioId,
+                    _windowClosingTokenSource.Token);
+
+                await _audioPlaybackService.PlayWavAsync(
+                    audioBytes,
+                    _windowClosingTokenSource.Token);
+
+                if (!_voiceInputController.SessionEnabled)
+                {
+                    StatusText.Text = "返答音声再生完了";
+                    InputHintText.Text = "音声入力開始を押すと、話しかける準備ができます。";
+                }
+
+                // 1回の開始操作で次の発話も受け付けるため、セッションが有効なら再生後に待機へ戻します。
+                _voiceInputController.ResumeAfterResponse();
+                return true;
             }
-            else
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                StatusText.Text = "返答音声再生完了";
-                InputHintText.Text = "音声入力開始を押すと、話しかける準備ができます。";
-                ApplyVoiceInputState(VoiceInputState.Ready);
+                lastException = ex;
+                if (attempt == 1)
+                {
+                    try
+                    {
+                        await Task.Delay(250, _windowClosingTokenSource.Token);
+                    }
+                    catch (OperationCanceledException) when (_windowClosingTokenSource.IsCancellationRequested)
+                    {
+                        return false;
+                    }
+                }
+            }
+            catch (OperationCanceledException) when (_windowClosingTokenSource.IsCancellationRequested)
+            {
+                return false;
             }
         }
-        catch (Exception ex)
+
+        _voiceInputController.SetExternalFailure();
+        StatusText.Text = "返答音声再生失敗";
+        InputHintText.Text = "音声ファイルを取得または再生できませんでした。";
+        AddErrorMessage($"返答音声を再生できませんでした: {lastException?.Message}");
+        return false;
+    }
+
+    private async Task PlayAudioOnceAsync(Guid audioId)
+    {
+        if (_completedAudioPlaybackIds.Contains(audioId))
         {
-            _voiceInputSessionEnabled = false;
-            ApplyVoiceInputState(VoiceInputState.Error);
-            StatusText.Text = "返答音声再生失敗";
-            InputHintText.Text = "音声ファイルを取得または再生できませんでした。";
-            AddSystemMessage($"返答音声を再生できませんでした: {ex.Message}");
+            return;
+        }
+
+        if (!_activeAudioPlaybackTasks.TryGetValue(audioId, out var playbackTask))
+        {
+            playbackTask = DownloadAndPlayAudioWithRetryAsync(audioId);
+            _activeAudioPlaybackTasks.Add(audioId, playbackTask);
+        }
+
+        try
+        {
+            if (await playbackTask)
+            {
+                _completedAudioPlaybackIds.Add(audioId);
+            }
+        }
+        finally
+        {
+            _activeAudioPlaybackTasks.Remove(audioId);
         }
     }
 
     private bool IsCurrentConversation(Guid conversationId)
     {
-        // SignalRは現在Allクライアントへ通知しています。
-        // そのため、自分が開いている会話IDの通知だけを画面に反映します。
+        // Backendでも会話グループへ絞っていますが、画面側でもIDを確認します。
+        // 再接続直後などに古い通知が届いても、別の会話へ誤表示しないための二重の防御です。
         return _conversationId is not null && _conversationId.Value == conversationId;
     }
 
@@ -495,6 +516,7 @@ public partial class MainWindow : Window
         {
             ProcessingStage.Upload => "アップロード",
             ProcessingStage.Stt => "STT",
+            ProcessingStage.Rag => "RAG",
             ProcessingStage.Gemini => "Gemini",
             ProcessingStage.Tts => "TTS",
             ProcessingStage.Database => "DB",
@@ -511,17 +533,6 @@ public partial class MainWindow : Window
             TurnEventType.Failed => "失敗",
             TurnEventType.Info => "情報",
             _ => eventType.ToString()
-        };
-    }
-
-    private static string FormatTurnStatus(TurnStatus status)
-    {
-        return status switch
-        {
-            TurnStatus.Processing => "処理中",
-            TurnStatus.Completed => "完了",
-            TurnStatus.Failed => "失敗",
-            _ => status.ToString()
         };
     }
 
@@ -543,7 +554,8 @@ public partial class MainWindow : Window
 
             // 履歴更新では、画面のメッセージ一覧をDBの状態に合わせて作り直します。
             // これにより、SignalRを取り逃してもBackendに保存済みの状態へ戻せます。
-            ReplaceMessagesFromTurns(turns);
+            _chatMessages.ReplaceFromTurns(turns);
+            RememberObservedTurns(turns);
             StatusText.Text = $"Backend接続済み / {turns.Count}ターン";
             InputHintText.Text = "履歴を更新しました。";
         }
@@ -551,78 +563,45 @@ public partial class MainWindow : Window
         {
             StatusText.Text = "履歴取得失敗";
             InputHintText.Text = "Backendの状態を確認してください。";
-            AddSystemMessage($"履歴を取得できませんでした: {ex.Message}");
+            AddErrorMessage($"履歴を取得できませんでした: {ex.Message}");
         }
     }
 
-    private void ReplaceMessagesFromTurns(IReadOnlyList<ConversationTurnDto> turns)
+    private async Task<bool> TryRefreshTurnsAfterUploadFailureAsync(
+        IReadOnlySet<Guid> turnIdsBeforeUpload)
     {
-        // SignalRで先に届いた発話は、履歴取得の時点ではまだDBへ反映されていないことがあります。
-        // 再描画前にターンID付きの表示を退避し、DBの項目が空ならその表示を戻します。
-        var displayedConversationMessages = _messages
-            .Where(x => x.IsConversationMessage && x.TurnId is not null)
-            .ToList();
-
-        _messages.Clear();
-        MessagesPanel.Children.Clear();
-        MessagesPanel.Children.Add(_messageEndSpacer);
-
-        if (turns.Count == 0)
+        if (_conversationId is null)
         {
-            if (displayedConversationMessages.Count > 0)
-            {
-                foreach (var message in displayedConversationMessages)
-                {
-                    AddMessageToPanel(message);
-                }
-
-                return;
-            }
-
-            AddSystemMessage("この会話にはまだ発話がありません。");
-            return;
+            return false;
         }
 
+        try
+        {
+            var turns = await _backendApiClient.ListConversationTurnsAsync(
+                _conversationId.Value,
+                _windowClosingTokenSource.Token);
+
+            _chatMessages.ReplaceFromTurns(turns);
+            RememberObservedTurns(turns);
+
+            // ここでは失敗表示を成功表示へ上書きしません。
+            // 今回新しく作られ、failedまで保存されたターンがある時だけBackend側の失敗と判断します。
+            return turns.Any(turn =>
+                !turnIdsBeforeUpload.Contains(turn.Id)
+                && turn.Status == TurnStatus.Failed);
+        }
+        catch
+        {
+            // 履歴まで取得できない時は、送信元の通信エラーを表示する方が利用者に状況を伝えられます。
+            return false;
+        }
+    }
+
+    private void RememberObservedTurns(IEnumerable<STSApp.Contracts.Models.ConversationTurnDto> turns)
+    {
         foreach (var turn in turns)
         {
-            var displayedUserText = displayedConversationMessages
-                .FirstOrDefault(x => x.TurnId == turn.Id && x.Speaker == "ユーザー")
-                ?.Text;
-            var displayedAssistantText = displayedConversationMessages
-                .FirstOrDefault(x => x.TurnId == turn.Id && x.Speaker == "アシスタント")
-                ?.Text;
-
-            var userText = string.IsNullOrWhiteSpace(turn.UserText)
-                ? displayedUserText
-                : turn.UserText;
-            var assistantText = string.IsNullOrWhiteSpace(turn.AssistantText)
-                ? displayedAssistantText
-                : turn.AssistantText;
-
-            if (!string.IsNullOrWhiteSpace(userText))
-            {
-                AddUserMessage(userText, turn.Id);
-            }
-
-            if (!string.IsNullOrWhiteSpace(assistantText))
-            {
-                AddAssistantMessage(assistantText, turn.Id);
-            }
-
-            // STTで失敗した場合などは、ユーザー発話テキストもAI返答テキストもまだ入っていません。
-            // その場合でも「ターンは作られている」と分かるように、履歴更新時に状態を表示します。
-            if (string.IsNullOrWhiteSpace(userText)
-                && string.IsNullOrWhiteSpace(assistantText)
-                && turn.ErrorMessage is null)
-            {
-                AddSystemMessage($"ターン状態: {FormatTurnStatus(turn.Status)}");
-            }
-
-            if (turn.ErrorMessage is not null)
-            {
-                var stageText = turn.ErrorStage is null ? "不明" : FormatStage(turn.ErrorStage.Value);
-                AddSystemMessage($"エラー: {stageText} / {turn.ErrorMessage}");
-            }
+            _observedTurnIds.Add(turn.Id);
         }
     }
 
@@ -634,11 +613,9 @@ public partial class MainWindow : Window
 
     private void ApplyVoiceInputState(VoiceInputState state)
     {
-        _voiceInputState = state;
-
         // Backend処理中だけは停止・開始を受け付けません。
         // 処理中にマイクを開くと、どの発話への返答かが混ざってしまうためです。
-        VoiceInputButton.IsEnabled = state != VoiceInputState.Processing;
+        VoiceInputButton.IsEnabled = _isBackendReady && state != VoiceInputState.Processing;
 
         VoiceInputButton.Content = state switch
         {
@@ -650,128 +627,20 @@ public partial class MainWindow : Window
 
     private void AddUserMessage(string text, Guid? turnId = null)
     {
-        AddMessageToPanel(ChatMessageItem.User(text, turnId));
+        _chatMessages.AddUserMessage(text, turnId);
     }
 
-    private void AddSystemMessage(string text)
+    private void AddErrorMessage(string text, Guid? turnId = null)
     {
-        AddMessageToPanel(ChatMessageItem.System(text));
+        _chatMessages.AddErrorMessage(text, turnId);
     }
 
-    private void AddAssistantMessage(string text, Guid? turnId = null)
+    private void AddAssistantMessage(
+        string text,
+        Guid? turnId = null,
+        AnswerBasis? answerBasis = null)
     {
-        AddMessageToPanel(ChatMessageItem.Assistant(text, turnId));
-    }
-
-    private void AddMessageToPanel(ChatMessageItem message)
-    {
-        _messages.Add(message);
-        // 終端領域を常に最後に置くため、新しいカードはその直前へ挿入します。
-        var spacerIndex = Math.Max(0, MessagesPanel.Children.Count - 1);
-        MessagesPanel.Children.Insert(spacerIndex, CreateMessageCard(message));
-        ScrollToLatestMessage();
-    }
-
-    private static Border CreateMessageEndSpacer()
-    {
-        return new Border
-        {
-            // 初期値は0にし、レイアウト後に最後尾カードの不足量から決めます。
-            Height = 0,
-            IsHitTestVisible = false
-        };
-    }
-
-    private void MessagesScrollViewer_LayoutUpdated(object? sender, EventArgs e)
-    {
-        var lastCard = MessagesPanel.Children
-            .OfType<Border>()
-            .LastOrDefault(card => !ReferenceEquals(card, _messageEndSpacer));
-
-        if (lastCard is null)
-        {
-            return;
-        }
-
-        var lastCardBottom = lastCard.TranslatePoint(
-            new Point(0, lastCard.Bounds.Height),
-            MessagesScrollViewer)?.Y;
-
-        if (lastCardBottom is null)
-        {
-            return;
-        }
-
-        // カードの位置はScrollViewerの表示座標、Extentはスクロール内容の座標です。
-        // Offsetを足して同じ内容座標へそろえます。
-        var lastCardBottomInContent = lastCardBottom.Value + MessagesScrollViewer.Offset.Y;
-
-        // 現在の終端領域を除いた、一覧が認識している終端を求めます。
-        // ここへ最後尾カードが収まっていなければ、その不足分を終端領域へ加えます。
-        var currentSpacerHeight = _messageEndSpacer.Height;
-        var contentEndWithoutSpacer = MessagesScrollViewer.Extent.Height - currentSpacerHeight;
-        var missingEndSpace = Math.Max(
-            0,
-            lastCardBottomInContent - contentEndWithoutSpacer);
-
-        // missingEndSpaceは「現在の終端領域を除いた一覧」に対して必要な量です。
-        // 現在値を足し戻すと、画面拡大時や履歴短縮時に余白が縮まらなくなります。
-        var requiredSpacerHeight = missingEndSpace;
-        if (Math.Abs(requiredSpacerHeight - currentSpacerHeight) < 0.5)
-        {
-            return;
-        }
-
-        _messageEndSpacer.Height = requiredSpacerHeight;
-    }
-
-    private static Border CreateMessageCard(ChatMessageItem message)
-    {
-        var messageStack = new StackPanel
-        {
-            Spacing = 6
-        };
-
-        messageStack.Children.Add(new TextBlock
-        {
-            Text = message.Speaker,
-            FontSize = 12,
-            FontWeight = Avalonia.Media.FontWeight.SemiBold,
-            Foreground = message.SpeakerColor
-        });
-
-        messageStack.Children.Add(new TextBlock
-        {
-            Text = message.Text,
-            FontSize = 15,
-            TextWrapping = Avalonia.Media.TextWrapping.Wrap,
-            Foreground = Avalonia.Media.Brush.Parse("#20242C")
-        });
-
-        return new Border
-        {
-            Margin = new Thickness(0, 0, 0, 12),
-            Padding = new Thickness(14, 12),
-            Background = message.Background,
-            BorderBrush = message.BorderBrush,
-            BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(8),
-            MaxWidth = 720,
-            HorizontalAlignment = message.Alignment,
-            Child = messageStack
-        };
-    }
-
-    private void ScrollToLatestMessage()
-    {
-        // メッセージが1件追加されるたびに、独立したスクロール要求を登録します。
-        // 追加要求を一つにまとめると、先に追加されたメッセージのためのスクロールが
-        // まだ古いレイアウトを見ている間に、後続メッセージの要求が捨てられる可能性があります。
-        // メッセージ数が通常の会話規模であれば、正しく最新位置へ移動することを優先します。
-        Dispatcher.UIThread.Post(() =>
-        {
-            MessagesScrollViewer.ScrollToEnd();
-        }, DispatcherPriority.Render);
+        _chatMessages.AddAssistantMessage(text, turnId, answerBasis);
     }
 
 }

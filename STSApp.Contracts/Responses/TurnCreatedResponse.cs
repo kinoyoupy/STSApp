@@ -1,7 +1,10 @@
 namespace STSApp.Contracts.Responses;
 
 /// <summary>
-/// 音声アップロード後、Backend側で処理対象ターンを受け付けたことを返すレスポンスです。
-/// 実際のSTT結果やAI返答はSignalRイベントでも通知します。
+/// 音声対話の処理が完了した時に返すレスポンスです。
+/// OutputAudioIdは、SignalR通知を取り逃した場合でも返答音声を取得できるように返します。
 /// </summary>
-public sealed record TurnCreatedResponse(Guid ConversationId, Guid TurnId);
+public sealed record TurnCreatedResponse(
+    Guid ConversationId,
+    Guid TurnId,
+    Guid OutputAudioId);
