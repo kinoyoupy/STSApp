@@ -66,6 +66,15 @@ public sealed class ContinuousAudioRecorder : IDisposable
         Interlocked.Exchange(ref _capturedFrameCount, 0);
 
         var errorBuffer = new byte[1024];
+        if (!NativeMethods.CheckMicrophonePermission(errorBuffer))
+        {
+            var permissionMessage = Encoding.UTF8.GetString(errorBuffer).TrimEnd('\0');
+            throw new InvalidOperationException(
+                string.IsNullOrWhiteSpace(permissionMessage)
+                    ? "macOSのマイク権限を確認できませんでした。"
+                    : permissionMessage);
+        }
+
         if (!NativeMethods.Start(_nativeRecorder, errorBuffer))
         {
             var message = Encoding.UTF8.GetString(errorBuffer).TrimEnd('\0');
@@ -234,6 +243,9 @@ public sealed class ContinuousAudioRecorder : IDisposable
         [DllImport(LibraryName, EntryPoint = "sts_continuous_audio_recorder_start", CallingConvention = CallingConvention.Cdecl)]
         private static extern int NativeStart(IntPtr recorder, byte[] errorMessage, int errorCapacity);
 
+        [DllImport(LibraryName, EntryPoint = "sts_continuous_audio_recorder_check_microphone_permission", CallingConvention = CallingConvention.Cdecl)]
+        private static extern int NativeCheckMicrophonePermission(byte[] errorMessage, int errorCapacity);
+
         [DllImport(LibraryName, EntryPoint = "sts_continuous_audio_recorder_begin_audio_capture", CallingConvention = CallingConvention.Cdecl)]
         private static extern int NativeBeginAudioCapture(IntPtr recorder, byte[] errorMessage, int errorCapacity);
 
@@ -257,6 +269,9 @@ public sealed class ContinuousAudioRecorder : IDisposable
 
         public static bool Start(IntPtr recorder, byte[] errorMessage)
             => NativeStart(recorder, errorMessage, errorMessage.Length) != 0;
+
+        public static bool CheckMicrophonePermission(byte[] errorMessage)
+            => NativeCheckMicrophonePermission(errorMessage, errorMessage.Length) != 0;
 
         public static bool BeginAudioCapture(IntPtr recorder, byte[] errorMessage)
             => NativeBeginAudioCapture(recorder, errorMessage, errorMessage.Length) != 0;

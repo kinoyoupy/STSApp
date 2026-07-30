@@ -25,16 +25,19 @@
                                FontWeight="SemiBold"
                                Foreground="#20242C" />
                     <TextBlock x:Name="StatusText"
-                               Text="Backend未接続"
+                               Text="サーバー未接続"
                                FontSize="13"
                                Foreground="#657085" />
                 </StackPanel>
 
                 <Button Grid.Column="1"
                         x:Name="RefreshButton"
-                        Content="履歴更新"
+                        Content="会話を同期"
                         MinWidth="96"
+                        HorizontalContentAlignment="Center"
+                        VerticalContentAlignment="Center"
                         VerticalAlignment="Center"
+                        ToolTip.Tip="サーバーに保存された会話内容を画面へ読み直します。"
                         Click="RefreshButton_Click" />
             </Grid>
         </Border>
@@ -54,7 +57,7 @@
                 Padding="20,14">
             <Grid ColumnDefinitions="*,Auto" ColumnSpacing="16">
                 <TextBlock x:Name="InputHintText"
-                           Text="音声入力開始を押すと、話しかける準備ができます。"
+                           Text="音声入力開始を押して、話しかけてください。"
                            VerticalAlignment="Center"
                            FontSize="14"
                            TextWrapping="Wrap"
@@ -66,6 +69,8 @@
                         Content="音声入力開始"
                         MinWidth="132"
                         Height="44"
+                        HorizontalContentAlignment="Center"
+                        VerticalContentAlignment="Center"
                         FontWeight="SemiBold"
                         Click="VoiceInputButton_Click" />
             </Grid>

@@ -10,13 +10,13 @@ namespace STSApp.Desktop;
 /// </summary>
 public sealed class VoiceEndpointDetector
 {
-    // 20msフレームを3回連続で発話と判定した場合、約60ms続いた発話として扱います。
-    // 単発の小さな雑音だけで発話開始しないための最小限の条件です。
-    private const int SpeechStartFrameCount = 3;
+    // 20msフレームを8回連続で発話と判定した場合、約160ms続いた発話として扱います。
+    // 発話開始の条件は、発話精度の改善を再開する時に改めて検証します。
+    private const int SpeechStartFrameCount = 8;
 
-    // 20msフレームを50回連続で非発話と判定した場合、約1秒の無音として扱います。
-    // 会話中の短い間や息継ぎで終話しないよう、開始判定より長く取ります。
-    private const int EndSilenceFrameCount = 50;
+    // 20msフレームを75回連続で非発話と判定した場合、約1.5秒の無音として扱います。
+    // 会話中の短い間や息継ぎで終話しないよう、1秒より長く待ってから送信します。
+    private const int EndSilenceFrameCount = 75;
 
     private readonly object _syncRoot = new();
     private bool _isRecording;

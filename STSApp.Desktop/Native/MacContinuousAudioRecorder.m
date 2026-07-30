@@ -231,6 +231,36 @@ STSContinuousAudioRecorder *sts_continuous_audio_recorder_create(
     return recorder;
 }
 
+int sts_continuous_audio_recorder_check_microphone_permission(
+    char *error_message,
+    int error_capacity) {
+    AVAuthorizationStatus status =
+        [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio];
+
+    if (status == AVAuthorizationStatusAuthorized) {
+        return 1;
+    }
+
+    NSString *message;
+    switch (status) {
+        case AVAuthorizationStatusDenied:
+            message = @"macOSのマイク権限が拒否されています。マイク権限を許可してDesktopアプリを再起動してください。";
+            break;
+        case AVAuthorizationStatusRestricted:
+            message = @"macOSの設定によりマイク利用が制限されています。マイク権限と入力デバイスを確認してください。";
+            break;
+        case AVAuthorizationStatusNotDetermined:
+            message = @"macOSのマイク権限が未設定です。マイク権限を許可してDesktopアプリを再起動してください。";
+            break;
+        default:
+            message = @"macOSのマイク権限を確認できませんでした。マイク権限を確認してDesktopアプリを再起動してください。";
+            break;
+    }
+
+    set_error(error_message, error_capacity, message);
+    return 0;
+}
+
 int sts_continuous_audio_recorder_start(
     STSContinuousAudioRecorder *recorder,
     char *error_message,

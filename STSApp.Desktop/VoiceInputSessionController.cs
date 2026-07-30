@@ -1,4 +1,6 @@
 using System;
+using System.Threading;
+using System.Threading.Tasks;
 using Avalonia.Threading;
 
 namespace STSApp.Desktop;
@@ -12,7 +14,9 @@ public sealed class VoiceInputSessionController : IDisposable
     private readonly ContinuousAudioRecorder _audioRecorder = new();
     private readonly WebRtcVoiceActivityDetector _voiceActivityDetector = new();
     private readonly VoiceEndpointDetector _voiceEndpointDetector = new();
+    private static readonly TimeSpan FirstAudioFrameTimeout = TimeSpan.FromSeconds(2);
     private bool _isCompletingUtterance;
+    private CancellationTokenSource? _frameWatchdogCancellation;
 
     public VoiceInputSessionController()
     {
@@ -46,6 +50,7 @@ public sealed class VoiceInputSessionController : IDisposable
     {
         SessionEnabled = false;
         _isCompletingUtterance = false;
+        CancelFrameWatchdog();
 
         try
         {
@@ -80,6 +85,7 @@ public sealed class VoiceInputSessionController : IDisposable
     {
         SessionEnabled = false;
         _isCompletingUtterance = false;
+        CancelFrameWatchdog();
 
         // 通常はBackend処理中でマイク停止済みですが、遅れて届いた失敗通知でも
         // マイクを開いたままにしないよう、待機・録音中なら明示的に後片付けします。
@@ -95,6 +101,7 @@ public sealed class VoiceInputSessionController : IDisposable
 
     public void Dispose()
     {
+        CancelFrameWatchdog();
         _audioRecorder.FrameCaptured -= _voiceActivityDetector.ProcessFrame;
         _voiceActivityDetector.FrameClassified -= _voiceEndpointDetector.ProcessVoiceActivity;
         _voiceEndpointDetector.StateChanged -= VoiceEndpointDetector_StateChanged;
@@ -104,6 +111,8 @@ public sealed class VoiceInputSessionController : IDisposable
 
     private void StartListeningCore()
     {
+        CancelFrameWatchdog();
+
         try
         {
             _isCompletingUtterance = false;
@@ -112,6 +121,10 @@ public sealed class VoiceInputSessionController : IDisposable
             _audioRecorder.StartListening();
             SetState(VoiceInputState.Listening);
             ActivityChanged?.Invoke(VoiceInputSessionActivity.ListeningStarted);
+
+            var watchdogCancellation = new CancellationTokenSource();
+            _frameWatchdogCancellation = watchdogCancellation;
+            _ = MonitorFirstAudioFrameAsync(watchdogCancellation);
         }
         catch (Exception exception)
         {
@@ -156,6 +169,7 @@ public sealed class VoiceInputSessionController : IDisposable
     {
         try
         {
+            CancelFrameWatchdog();
             _audioRecorder.BeginAudioCapture();
             SetState(VoiceInputState.Recording);
             ActivityChanged?.Invoke(VoiceInputSessionActivity.SpeechStarted);
@@ -183,6 +197,7 @@ public sealed class VoiceInputSessionController : IDisposable
         }
 
         _isCompletingUtterance = true;
+        CancelFrameWatchdog();
         SetState(VoiceInputState.Processing);
         ActivityChanged?.Invoke(VoiceInputSessionActivity.SpeechEnded);
 
@@ -227,6 +242,56 @@ public sealed class VoiceInputSessionController : IDisposable
             // 開始処理の元例外を利用者へ伝えることを優先します。
             // 後片付けの例外で原因を上書きしないため、ここでは追加送出しません。
         }
+    }
+
+    private async Task MonitorFirstAudioFrameAsync(CancellationTokenSource watchdogCancellation)
+    {
+        try
+        {
+            await Task.Delay(FirstAudioFrameTimeout, watchdogCancellation.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            return;
+        }
+
+        // タイマーの完了後に停止・発話開始が行われている可能性があるため、
+        // UIスレッドへ戻ってから状態とフレーム数をもう一度確認します。
+        Dispatcher.UIThread.Post(() =>
+        {
+            if (!ReferenceEquals(_frameWatchdogCancellation, watchdogCancellation)
+                || !SessionEnabled
+                || State != VoiceInputState.Listening
+                || _audioRecorder.CapturedFrameCount > 0)
+            {
+                watchdogCancellation.Dispose();
+                return;
+            }
+
+            _frameWatchdogCancellation = null;
+            watchdogCancellation.Dispose();
+            SessionEnabled = false;
+            _isCompletingUtterance = false;
+            _voiceActivityDetector.EndRecording();
+            _voiceEndpointDetector.EndRecording();
+            TryStopAndDiscard();
+            SetState(VoiceInputState.Error);
+            ErrorOccurred?.Invoke(new VoiceInputSessionError(
+                VoiceInputSessionErrorKind.Start,
+                "音声フレームを受信できませんでした。macOSのマイク権限、入力デバイスの接続状態を確認し、Desktopアプリを再起動してください。"));
+        });
+    }
+
+    private void CancelFrameWatchdog()
+    {
+        var cancellation = Interlocked.Exchange(ref _frameWatchdogCancellation, null);
+        if (cancellation is null)
+        {
+            return;
+        }
+
+        cancellation.Cancel();
+        cancellation.Dispose();
     }
 }
 
