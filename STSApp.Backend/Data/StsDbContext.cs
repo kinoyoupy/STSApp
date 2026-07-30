@@ -7,7 +7,7 @@ namespace STSApp.Backend.Data;
 
 /// <summary>
 /// STSシステムのMySQL接続をまとめるDbContextです。
-/// 設計書の conversations / conversation_turns / audio_files / turn_events に対応します。
+/// 会話・音声・処理履歴に加え、RAG資料・Embedding・参照履歴のテーブルにも対応します。
 /// </summary>
 public sealed class StsDbContext : DbContext
 {
@@ -20,6 +20,10 @@ public sealed class StsDbContext : DbContext
     public DbSet<ConversationTurnEntity> ConversationTurns => Set<ConversationTurnEntity>();
     public DbSet<AudioFileEntity> AudioFiles => Set<AudioFileEntity>();
     public DbSet<TurnEventEntity> TurnEvents => Set<TurnEventEntity>();
+    public DbSet<KnowledgeDocumentEntity> KnowledgeDocuments => Set<KnowledgeDocumentEntity>();
+    public DbSet<KnowledgeChunkEntity> KnowledgeChunks => Set<KnowledgeChunkEntity>();
+    public DbSet<KnowledgeChunkEmbeddingEntity> KnowledgeChunkEmbeddings => Set<KnowledgeChunkEmbeddingEntity>();
+    public DbSet<TurnRagReferenceEntity> TurnRagReferences => Set<TurnRagReferenceEntity>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -27,6 +31,10 @@ public sealed class StsDbContext : DbContext
         ConfigureConversationTurns(modelBuilder);
         ConfigureAudioFiles(modelBuilder);
         ConfigureTurnEvents(modelBuilder);
+        ConfigureKnowledgeDocuments(modelBuilder);
+        ConfigureKnowledgeChunks(modelBuilder);
+        ConfigureKnowledgeChunkEmbeddings(modelBuilder);
+        ConfigureTurnRagReferences(modelBuilder);
     }
 
     private static void ConfigureConversations(ModelBuilder modelBuilder)
@@ -60,6 +68,7 @@ public sealed class StsDbContext : DbContext
     {
         var statusConverter = CreateEnumConverter<TurnStatus>();
         var stageConverter = CreateNullableEnumConverter<ProcessingStage>();
+        var answerBasisConverter = CreateNullableEnumConverter<AnswerBasis>();
 
         modelBuilder.Entity<ConversationTurnEntity>(entity =>
         {
@@ -83,6 +92,11 @@ public sealed class StsDbContext : DbContext
                 .HasColumnName("assistant_text")
                 .HasColumnType("text");
 
+            entity.Property(x => x.AnswerBasis)
+                .HasColumnName("answer_basis")
+                .HasColumnType("enum('knowledge_grounded','general_knowledge')")
+                .HasConversion(answerBasisConverter);
+
             entity.Property(x => x.Status)
                 .HasColumnName("status")
                 .HasColumnType("enum('processing','completed','failed')")
@@ -90,7 +104,7 @@ public sealed class StsDbContext : DbContext
 
             entity.Property(x => x.ErrorStage)
                 .HasColumnName("error_stage")
-                .HasColumnType("enum('upload','stt','gemini','tts','database')")
+                .HasColumnType("enum('upload','stt','rag','gemini','tts','database')")
                 .HasConversion(stageConverter);
 
             entity.Property(x => x.ErrorMessage)
@@ -193,7 +207,7 @@ public sealed class StsDbContext : DbContext
 
             entity.Property(x => x.Stage)
                 .HasColumnName("stage")
-                .HasColumnType("enum('upload','stt','gemini','tts','database')")
+                .HasColumnType("enum('upload','stt','rag','gemini','tts','database')")
                 .HasConversion(stageConverter);
 
             entity.Property(x => x.EventType)
@@ -226,6 +240,82 @@ public sealed class StsDbContext : DbContext
         });
     }
 
+    private static void ConfigureKnowledgeDocuments(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<KnowledgeDocumentEntity>(entity =>
+        {
+            entity.ToTable("knowledge_documents");
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.Id).HasColumnName("id").HasColumnType("bigint unsigned").ValueGeneratedOnAdd();
+            entity.Property(x => x.SourcePath).HasColumnName("source_path").HasCharSet("ascii").HasMaxLength(1024).IsRequired();
+            entity.Property(x => x.Title).HasColumnName("title").HasMaxLength(500).IsRequired();
+            entity.Property(x => x.SourceHash).HasColumnName("source_hash").HasCharSet("ascii").HasColumnType("char(64)").IsRequired();
+            entity.Property(x => x.CreatedAt).HasColumnName("created_at").HasColumnType("datetime(6)");
+            entity.Property(x => x.UpdatedAt).HasColumnName("updated_at").HasColumnType("datetime(6)");
+            entity.HasIndex(x => x.SourcePath).IsUnique();
+        });
+    }
+
+    private static void ConfigureKnowledgeChunks(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<KnowledgeChunkEntity>(entity =>
+        {
+            entity.ToTable("knowledge_chunks");
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.Id).HasColumnName("id").HasColumnType("bigint unsigned").ValueGeneratedOnAdd();
+            entity.Property(x => x.KnowledgeDocumentId).HasColumnName("knowledge_document_id").HasColumnType("bigint unsigned");
+            entity.Property(x => x.ParentHeading).HasColumnName("parent_heading").HasMaxLength(500);
+            entity.Property(x => x.Heading).HasColumnName("heading").HasMaxLength(500).IsRequired();
+            entity.Property(x => x.Content).HasColumnName("content").HasColumnType("longtext").IsRequired();
+            entity.Property(x => x.ChunkOrder).HasColumnName("chunk_order");
+            entity.Property(x => x.ContentHash).HasColumnName("content_hash").HasCharSet("ascii").HasColumnType("char(64)").IsRequired();
+            entity.Property(x => x.CreatedAt).HasColumnName("created_at").HasColumnType("datetime(6)");
+            entity.Property(x => x.UpdatedAt).HasColumnName("updated_at").HasColumnType("datetime(6)");
+            entity.HasIndex(x => new { x.KnowledgeDocumentId, x.ChunkOrder }).IsUnique();
+            entity.HasOne<KnowledgeDocumentEntity>().WithMany().HasForeignKey(x => x.KnowledgeDocumentId).OnDelete(DeleteBehavior.Cascade);
+        });
+    }
+
+    private static void ConfigureKnowledgeChunkEmbeddings(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<KnowledgeChunkEmbeddingEntity>(entity =>
+        {
+            entity.ToTable("knowledge_chunk_embeddings");
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.Id).HasColumnName("id").HasColumnType("bigint unsigned").ValueGeneratedOnAdd();
+            entity.Property(x => x.KnowledgeChunkId).HasColumnName("knowledge_chunk_id").HasColumnType("bigint unsigned");
+            entity.Property(x => x.ModelName).HasColumnName("model_name").HasCharSet("ascii").HasMaxLength(100).IsRequired();
+            entity.Property(x => x.Dimensions).HasColumnName("dimensions");
+            entity.Property(x => x.VectorJson).HasColumnName("vector_json").HasColumnType("json").IsRequired();
+            entity.Property(x => x.CreatedAt).HasColumnName("created_at").HasColumnType("datetime(6)");
+            entity.HasIndex(x => x.KnowledgeChunkId).IsUnique();
+            entity.HasOne<KnowledgeChunkEntity>().WithMany().HasForeignKey(x => x.KnowledgeChunkId).OnDelete(DeleteBehavior.Cascade);
+        });
+    }
+
+    private static void ConfigureTurnRagReferences(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<TurnRagReferenceEntity>(entity =>
+        {
+            entity.ToTable("turn_rag_references");
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.Id).HasColumnName("id").HasColumnType("bigint unsigned").ValueGeneratedOnAdd();
+            entity.Property(x => x.ConversationTurnId).HasColumnName("conversation_turn_id").HasColumnType("char(36)");
+            entity.Property(x => x.KnowledgeChunkId).HasColumnName("knowledge_chunk_id").HasColumnType("bigint unsigned");
+            entity.Property(x => x.RetrievalRank).HasColumnName("retrieval_rank");
+            entity.Property(x => x.SimilarityScore).HasColumnName("similarity_score").HasPrecision(8, 6);
+            entity.Property(x => x.DocumentTitleSnapshot).HasColumnName("document_title_snapshot").HasMaxLength(500).IsRequired();
+            entity.Property(x => x.ParentHeadingSnapshot).HasColumnName("parent_heading_snapshot").HasMaxLength(500);
+            entity.Property(x => x.HeadingSnapshot).HasColumnName("heading_snapshot").HasMaxLength(500).IsRequired();
+            entity.Property(x => x.ContentSnapshot).HasColumnName("content_snapshot").HasColumnType("longtext").IsRequired();
+            entity.Property(x => x.CreatedAt).HasColumnName("created_at").HasColumnType("datetime(6)");
+            entity.HasIndex(x => new { x.ConversationTurnId, x.RetrievalRank }).IsUnique();
+            entity.HasIndex(x => new { x.ConversationTurnId, x.KnowledgeChunkId }).IsUnique();
+            entity.HasOne<ConversationTurnEntity>().WithMany().HasForeignKey(x => x.ConversationTurnId).OnDelete(DeleteBehavior.Cascade);
+            entity.HasOne<KnowledgeChunkEntity>().WithMany().HasForeignKey(x => x.KnowledgeChunkId).OnDelete(DeleteBehavior.SetNull);
+        });
+    }
+
     private static ValueConverter<TEnum, string> CreateEnumConverter<TEnum>()
         where TEnum : struct, Enum
     {
@@ -252,9 +342,12 @@ public sealed class StsDbContext : DbContext
             nameof(TurnStatus.Failed) => "failed",
             nameof(ProcessingStage.Upload) => "upload",
             nameof(ProcessingStage.Stt) => "stt",
+            nameof(ProcessingStage.Rag) => "rag",
             nameof(ProcessingStage.Gemini) => "gemini",
             nameof(ProcessingStage.Tts) => "tts",
             nameof(ProcessingStage.Database) => "database",
+            nameof(AnswerBasis.KnowledgeGrounded) => "knowledge_grounded",
+            nameof(AnswerBasis.GeneralKnowledge) => "general_knowledge",
             nameof(TurnEventType.Started) => "started",
             nameof(TurnEventType.Info) => "info",
             nameof(AudioFileKind.Input) => "input",
@@ -277,9 +370,12 @@ public sealed class StsDbContext : DbContext
                 : nameof(TurnStatus.Failed),
             "upload" => nameof(ProcessingStage.Upload),
             "stt" => nameof(ProcessingStage.Stt),
+            "rag" => nameof(ProcessingStage.Rag),
             "gemini" => nameof(ProcessingStage.Gemini),
             "tts" => nameof(ProcessingStage.Tts),
             "database" => nameof(ProcessingStage.Database),
+            "knowledge_grounded" => nameof(AnswerBasis.KnowledgeGrounded),
+            "general_knowledge" => nameof(AnswerBasis.GeneralKnowledge),
             "started" => nameof(TurnEventType.Started),
             "info" => nameof(TurnEventType.Info),
             "input" => nameof(AudioFileKind.Input),

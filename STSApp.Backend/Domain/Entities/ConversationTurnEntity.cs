@@ -12,6 +12,7 @@ public sealed class ConversationTurnEntity
     public Guid ConversationId { get; init; }
     public string? UserText { get; set; }
     public string? AssistantText { get; set; }
+    public AnswerBasis? AnswerBasis { get; set; }
     public TurnStatus Status { get; set; }
     public ProcessingStage? ErrorStage { get; set; }
     public string? ErrorMessage { get; set; }

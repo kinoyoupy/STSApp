@@ -8,6 +8,7 @@ using STSApp.Backend.Options;
 using STSApp.Backend.Repositories;
 using STSApp.Backend.Services;
 using STSApp.Backend.Services.External;
+using STSApp.Backend.Services.Rag;
 using STSApp.Backend.Services.Storage;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -21,6 +22,11 @@ builder.Services
     options.JsonSerializerOptions.Converters.Add(new JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower));
 });
 
+// DB例外はControllerごとに捕まえるのではなく、共通処理で503へ変換します。
+// これにより、存在確認など新しいDB呼び出しを追加してもエラー処理の囲み忘れを防げます。
+builder.Services.AddProblemDetails();
+builder.Services.AddExceptionHandler<DatabaseExceptionHandler>();
+
 builder.Services
     .AddSignalR()
     .AddJsonProtocol(options =>
@@ -31,6 +37,7 @@ builder.Services
 // 実URLやAPIキーは設計書へ書かず、appsettings / 環境変数から渡します。
 builder.Services.Configure<ExternalApiOptions>(builder.Configuration.GetSection(ExternalApiOptions.SectionName));
 builder.Services.Configure<StorageOptions>(builder.Configuration.GetSection(StorageOptions.SectionName));
+builder.Services.Configure<RagOptions>(builder.Configuration.GetSection(RagOptions.SectionName));
 
 var mysqlConnectionString = builder.Configuration.GetConnectionString("MySql");
 if (!string.IsNullOrWhiteSpace(mysqlConnectionString))
@@ -44,7 +51,11 @@ if (!string.IsNullOrWhiteSpace(mysqlConnectionString))
 builder.Services.AddScoped<DatabaseHealthCheck>();
 builder.Services.AddScoped<DatabaseInitializer>();
 builder.Services.AddScoped<IConversationRepository, ConversationRepository>();
+builder.Services.AddScoped<IKnowledgeRepository, KnowledgeRepository>();
 builder.Services.AddScoped<IAudioFileStorage, LocalAudioFileStorage>();
+builder.Services.AddSingleton<MarkdownKnowledgeChunkParser>();
+builder.Services.AddScoped<IKnowledgeBaseIndexer, KnowledgeBaseIndexer>();
+builder.Services.AddScoped<IKnowledgeSearchService, KnowledgeSearchService>();
 
 var externalApis = builder.Configuration.GetSection(ExternalApiOptions.SectionName).Get<ExternalApiOptions>() ?? new ExternalApiOptions();
 
@@ -55,6 +66,7 @@ if (externalApis.UseDevelopmentMocks)
     builder.Services.AddSingleton<ISttClient, DevelopmentMockSttClient>();
     builder.Services.AddSingleton<IGeminiClient, DevelopmentMockGeminiClient>();
     builder.Services.AddSingleton<ITtsClient, DevelopmentMockTtsClient>();
+    builder.Services.AddSingleton<IEmbeddingClient, NotConfiguredEmbeddingClient>();
 }
 else
 {
@@ -79,7 +91,7 @@ else
     }
 
     var geminiOptions = externalApis.Gemini;
-    if (string.IsNullOrWhiteSpace(geminiOptions?.ApiKey) || string.IsNullOrWhiteSpace(geminiOptions.ModelName))
+    if (string.IsNullOrWhiteSpace(geminiOptions.ApiKey) || string.IsNullOrWhiteSpace(geminiOptions.ModelName))
     {
         // GeminiはAPIキーとモデル名が両方必要です。
         // 片方だけ設定された状態で中途半端に呼び出さないよう、両方揃うまでは未設定扱いにします。
@@ -96,6 +108,23 @@ else
             // GeminiのAPIキーとモデル名は設定から渡します。
             // APIキーをAvalonia側へ置かないため、Gemini呼び出しはBackendだけが担当します。
             httpClient.Timeout = TimeSpan.FromSeconds(externalApiOptions.Gemini.TimeoutSeconds);
+        });
+    }
+
+    var ragOptions = builder.Configuration.GetSection(RagOptions.SectionName).Get<RagOptions>() ?? new RagOptions();
+    if (string.IsNullOrWhiteSpace(geminiOptions.ApiKey)
+        || string.IsNullOrWhiteSpace(ragOptions.EmbeddingModelName))
+    {
+        builder.Services.AddSingleton<IEmbeddingClient, NotConfiguredEmbeddingClient>();
+    }
+    else
+    {
+        builder.Services.AddHttpClient<IEmbeddingClient, HttpGeminiEmbeddingClient>((serviceProvider, httpClient) =>
+        {
+            var configuredRagOptions = serviceProvider
+                .GetRequiredService<Microsoft.Extensions.Options.IOptions<RagOptions>>()
+                .Value;
+            httpClient.Timeout = TimeSpan.FromSeconds(configuredRagOptions.TimeoutSeconds);
         });
     }
 
@@ -124,11 +153,19 @@ builder.Services.AddScoped<IConversationWorkflow, ConversationWorkflow>();
 
 var app = builder.Build();
 
-if (app.Environment.IsDevelopment())
+app.UseExceptionHandler();
+
+using (var scope = app.Services.CreateScope())
 {
-    using var scope = app.Services.CreateScope();
     var initializer = scope.ServiceProvider.GetRequiredService<DatabaseInitializer>();
-    await initializer.EnsureCreatedAsync(CancellationToken.None);
+    if (app.Environment.IsDevelopment())
+    {
+        await initializer.EnsureCreatedAsync(CancellationToken.None);
+    }
+
+    // 前回のBackend停止でprocessingのまま残ったターンは、次の会話と混同しないよう起動時に回収します。
+    // Development以外ではスキーマ作成は行いませんが、既存データの状態回収は同じように必要です。
+    await initializer.RecoverInterruptedTurnsAsync(CancellationToken.None);
 }
 
 app.MapControllers();

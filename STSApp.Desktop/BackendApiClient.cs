@@ -24,15 +24,25 @@ public sealed class BackendApiClient : IDisposable
     private static readonly JsonSerializerOptions JsonOptions = CreateJsonOptions();
 
     private readonly HttpClient _httpClient;
+    private readonly HttpClient _audioTurnHttpClient;
 
     public BackendApiClient(string baseUrl)
     {
         // HttpClientはAPI呼び出しごとにnewせず、クラス内で使い回します。
         // 短時間に何度も作ると接続管理が複雑になり、通信の不安定さにつながるためです。
-        _httpClient = new HttpClient
+        _httpClient = CreateHttpClient(baseUrl, TimeSpan.FromSeconds(60));
+
+        // 音声送信APIはSTT・RAG・Gemini・TTSを順番に待つため、合計時間を固定60秒で切れません。
+        // Windowを閉じた時のCancellationTokenは引き続き使い、利用者がアプリを閉じた時は待機を終了します。
+        _audioTurnHttpClient = CreateHttpClient(baseUrl, Timeout.InfiniteTimeSpan);
+    }
+
+    private static HttpClient CreateHttpClient(string baseUrl, TimeSpan timeout)
+    {
+        return new HttpClient
         {
             BaseAddress = new Uri(baseUrl),
-            Timeout = TimeSpan.FromSeconds(60)
+            Timeout = timeout
         };
     }
 
@@ -44,7 +54,7 @@ public sealed class BackendApiClient : IDisposable
         // ここで返るconversationIdは、以降の音声アップロードや履歴取得で使う「会話のキー」です。
         var response = await _httpClient.PostAsJsonAsync(
             "api/conversations",
-            new CreateConversationRequest(title),
+            new CreateConversationRequest { Title = title },
             JsonOptions,
             cancellationToken);
 
@@ -92,7 +102,7 @@ public sealed class BackendApiClient : IDisposable
         // multipartのフィールド名も "audioFile" に合わせます。
         form.Add(audioContent, "audioFile", audio.FileName);
 
-        var response = await _httpClient.PostAsync(
+        var response = await _audioTurnHttpClient.PostAsync(
             $"api/conversations/{conversationId}/turns/audio",
             form,
             cancellationToken);
@@ -156,6 +166,7 @@ public sealed class BackendApiClient : IDisposable
     public void Dispose()
     {
         _httpClient.Dispose();
+        _audioTurnHttpClient.Dispose();
     }
 
     private static JsonSerializerOptions CreateJsonOptions()

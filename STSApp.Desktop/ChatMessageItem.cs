@@ -1,6 +1,7 @@
 using Avalonia.Layout;
 using Avalonia.Media;
 using System;
+using STSApp.Contracts.Enums;
 
 namespace STSApp.Desktop;
 
@@ -17,8 +18,9 @@ public sealed class ChatMessageItem
         IBrush borderBrush,
         IBrush speakerColor,
         HorizontalAlignment alignment,
-        bool isConversationMessage,
-        Guid? turnId)
+        ChatMessageKind kind,
+        Guid? turnId,
+        AnswerBasis? answerBasis = null)
     {
         Speaker = speaker;
         Text = text;
@@ -26,8 +28,9 @@ public sealed class ChatMessageItem
         BorderBrush = borderBrush;
         SpeakerColor = speakerColor;
         Alignment = alignment;
-        IsConversationMessage = isConversationMessage;
+        Kind = kind;
         TurnId = turnId;
+        AnswerBasis = answerBasis;
     }
 
     public string Speaker { get; }
@@ -36,8 +39,10 @@ public sealed class ChatMessageItem
     public IBrush BorderBrush { get; }
     public IBrush SpeakerColor { get; }
     public HorizontalAlignment Alignment { get; }
-    public bool IsConversationMessage { get; }
+    public ChatMessageKind Kind { get; }
+    public bool IsConversationMessage => Kind == ChatMessageKind.Conversation;
     public Guid? TurnId { get; }
+    public AnswerBasis? AnswerBasis { get; }
 
     public static ChatMessageItem User(string text, Guid? turnId = null)
     {
@@ -48,24 +53,40 @@ public sealed class ChatMessageItem
             Brush.Parse("#B9D4FF"),
             Brush.Parse("#245A9F"),
             HorizontalAlignment.Right,
-            isConversationMessage: true,
+            kind: ChatMessageKind.Conversation,
             turnId: turnId);
     }
 
-    public static ChatMessageItem System(string text)
+    public static ChatMessageItem Error(string text, Guid? turnId = null)
+    {
+        return new ChatMessageItem(
+            "エラー",
+            text,
+            Brush.Parse("#FFF4F4"),
+            Brush.Parse("#E8B4B4"),
+            Brush.Parse("#A33A3A"),
+            HorizontalAlignment.Left,
+            kind: ChatMessageKind.Error,
+            turnId: turnId);
+    }
+
+    public static ChatMessageItem EmptyState()
     {
         return new ChatMessageItem(
             "システム",
-            text,
+            "この会話にはまだ発話がありません。",
             Brush.Parse("#FFFFFF"),
             Brush.Parse("#D9DEE7"),
             Brush.Parse("#657085"),
             HorizontalAlignment.Left,
-            isConversationMessage: false,
+            kind: ChatMessageKind.EmptyState,
             turnId: null);
     }
 
-    public static ChatMessageItem Assistant(string text, Guid? turnId = null)
+    public static ChatMessageItem Assistant(
+        string text,
+        Guid? turnId = null,
+        AnswerBasis? answerBasis = null)
     {
         return new ChatMessageItem(
             "アシスタント",
@@ -74,7 +95,18 @@ public sealed class ChatMessageItem
             Brush.Parse("#C7E7D2"),
             Brush.Parse("#2D7A4D"),
             HorizontalAlignment.Left,
-            isConversationMessage: true,
-            turnId: turnId);
+            kind: ChatMessageKind.Conversation,
+            turnId: turnId,
+            answerBasis: answerBasis);
     }
+}
+
+/// <summary>
+/// 履歴更新時に「DBから復元するもの」と「Desktop内だけで保持するもの」を区別するための種類です。
+/// </summary>
+public enum ChatMessageKind
+{
+    Conversation,
+    Error,
+    EmptyState
 }

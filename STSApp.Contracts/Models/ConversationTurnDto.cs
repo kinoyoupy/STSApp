@@ -11,6 +11,7 @@ public sealed record ConversationTurnDto(
     Guid ConversationId,
     string? UserText,
     string? AssistantText,
+    AnswerBasis? AnswerBasis,
     TurnStatus Status,
     ProcessingStage? ErrorStage,
     string? ErrorMessage,

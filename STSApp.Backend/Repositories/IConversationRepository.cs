@@ -13,6 +13,10 @@ public interface IConversationRepository
 
     Task<IReadOnlyList<ConversationDto>> ListConversationsAsync(CancellationToken cancellationToken);
 
+    Task<bool> ConversationExistsAsync(
+        Guid conversationId,
+        CancellationToken cancellationToken);
+
     Task<IReadOnlyList<ConversationTurnDto>> ListConversationTurnsAsync(
         Guid conversationId,
         CancellationToken cancellationToken);
@@ -49,6 +53,7 @@ public interface IConversationRepository
     Task UpdateAssistantTextAsync(
         Guid turnId,
         string assistantText,
+        AnswerBasis answerBasis,
         CancellationToken cancellationToken);
 
     Task<IReadOnlyList<(string UserText, string AssistantText)>> ListRecentCompletedTurnsAsync(

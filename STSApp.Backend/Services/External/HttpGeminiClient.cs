@@ -23,10 +23,7 @@ public sealed class HttpGeminiClient : IGeminiClient
         _options = options.Value.Gemini;
     }
 
-    public async Task<string> GenerateReplyAsync(
-        string userText,
-        IReadOnlyList<(string UserText, string AssistantText)> recentTurns,
-        CancellationToken cancellationToken)
+    public async Task<string> GenerateReplyAsync(GeminiReplyRequest replyRequest, CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(_options.ApiKey))
         {
@@ -48,15 +45,15 @@ public sealed class HttpGeminiClient : IGeminiClient
         // 入力テキストには、現在の発話だけでなく直近履歴も含めます。
         request.Content = JsonContent.Create(new GeminiRequest(
             _options.ModelName,
-            _options.SystemInstruction,
-            BuildInput(userText, recentTurns)));
+            BuildSystemInstruction(replyRequest.AnswerBasis),
+            BuildInput(replyRequest)));
 
         using var response = await _httpClient.SendAsync(request, cancellationToken);
         if (!response.IsSuccessStatusCode)
         {
-            var body = await response.Content.ReadAsStringAsync(cancellationToken);
+            // 応答本文に入力文や会話内容が含まれても、ログやDBへ残さないよう状態コードだけを扱います。
             throw new InvalidOperationException(
-                $"Gemini API request failed. StatusCode={(int)response.StatusCode}, Body={body}");
+                $"Gemini API request failed. StatusCode={(int)response.StatusCode}.");
         }
 
         var result = await response.Content.ReadFromJsonAsync<GeminiResponse>(cancellationToken);
@@ -75,21 +72,33 @@ public sealed class HttpGeminiClient : IGeminiClient
         return outputText.Trim();
     }
 
-    private static string BuildInput(
-        string userText,
-        IReadOnlyList<(string UserText, string AssistantText)> recentTurns)
+    private string BuildSystemInstruction(STSApp.Contracts.Enums.AnswerBasis answerBasis)
+    {
+        var ragInstruction = answerBasis switch
+        {
+            STSApp.Contracts.Enums.AnswerBasis.KnowledgeGrounded =>
+                "以下に渡されるVoiceLink資料だけを根拠に回答してください。資料に書かれていないVoiceLink固有の内容を推測で補わないでください。資料名、類似度、内部の検索処理には触れないでください。",
+            STSApp.Contracts.Enums.AnswerBasis.GeneralKnowledge =>
+                "VoiceLinkに関する資料は見つかっていません。直近の会話履歴にVoiceLink固有の情報が含まれていても根拠として使わず、VoiceLink固有の仕様・料金・保存期間などを推測して答えないでください。質問が一般的な内容であれば一般論として回答してください。",
+            _ => throw new InvalidOperationException($"Unsupported answer basis: {answerBasis}")
+        };
+
+        return $"{_options.SystemInstruction}\n\n{ragInstruction}";
+    }
+
+    private static string BuildInput(GeminiReplyRequest request)
     {
         // Geminiへ渡す内容をここで組み立てます。
         // DBには全履歴を保存しますが、APIへは直近数ターンだけ渡して入力を大きくしすぎないようにします。
         var builder = new StringBuilder();
 
-        if (recentTurns.Count > 0)
+        if (request.RecentTurns.Count > 0)
         {
             builder.AppendLine("直近の会話履歴:");
 
             // 会話履歴をすべて送ると入力が大きくなりすぎるため、直近数ターンに絞ります。
             // DBには全履歴を残し、Geminiへ渡す履歴だけを短くする、という分担です。
-            foreach (var turn in recentTurns.TakeLast(RecentTurnLimit))
+            foreach (var turn in request.RecentTurns.TakeLast(RecentTurnLimit))
             {
                 builder.AppendLine($"ユーザー: {turn.UserText}");
                 builder.AppendLine($"アシスタント: {turn.AssistantText}");
@@ -98,8 +107,19 @@ public sealed class HttpGeminiClient : IGeminiClient
             builder.AppendLine();
         }
 
+        if (request.References.Count > 0)
+        {
+            builder.AppendLine("VoiceLink資料（この資料だけを根拠に回答すること）:");
+            foreach (var reference in request.References)
+            {
+                builder.AppendLine($"見出し: {reference.Heading}");
+                builder.AppendLine(reference.Content);
+                builder.AppendLine();
+            }
+        }
+
         builder.AppendLine("現在のユーザー発話:");
-        builder.AppendLine(userText);
+        builder.AppendLine(request.UserText);
 
         return builder.ToString();
     }

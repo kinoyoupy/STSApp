@@ -11,6 +11,7 @@ public sealed class ExternalApiOptions
     /// <summary>
     /// 実APIをまだ設定しない段階で、BackendからDesktopまでの成功ルートを確認するための開発用設定です。
     /// true にすると、STT/Gemini/TTS の実HTTP APIではなく、Backend内の疑似実装を使います。
+    /// RAGは資料検索の正しさを確認する必要があるため、モック化せず明確な未設定エラーにします。
     /// </summary>
     public bool UseDevelopmentMocks { get; init; }
 

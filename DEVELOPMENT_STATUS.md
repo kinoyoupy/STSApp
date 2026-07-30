@@ -32,9 +32,9 @@
 ```
 
 画面には、ユーザー発話とアシスタント返答のカードが表示されました。
-また、返答音声の再生完了後に、次のPushToTalk入力を受け付けられる状態になることも確認しました。
+また、当時のPushToTalk方式では、返答音声の再生完了後に次の入力を受け付けられる状態になることも確認しました。
 
-なお、この確認では開発用モックを使用しています。
+なお、この時点の確認では開発用モックを使用しています。
 表示された文字起こし結果とGemini返答は、実際のSTTやGeminiによる結果ではなく、開発用に用意した固定の内容です。
 
 ### チャットUIの表示問題への対応
@@ -76,10 +76,10 @@
 
 - `STSApp.Backend`
   - ASP.NET Core Backend
-  - MySQL、STT、Gemini、TTS、音声保存、SignalR通知を担当
+  - MySQL、STT、Vector RAG、Gemini、TTS、音声保存、SignalR通知を担当
 - `STSApp.Desktop`
   - Avalonia Desktopアプリ
-  - チャットUI、PushToTalk、録音、Backend通信、SignalR受信、音声再生を担当
+  - チャットUI、VADによる発話・終話検知、録音、Backend通信、SignalR受信、音声再生を担当
 - `STSApp.Contracts`
   - DTO、enum、SignalRイベント、Request/Responseを共有
 - `docker-compose.yml`
@@ -101,11 +101,14 @@
 - Workflow
   - 音声アップロード
   - STT
+  - Vector RAG検索
   - Gemini
   - TTS
   - 音声ファイル保存
   - DBイベント保存
   - SignalR通知
+- 開発環境限定のRAG資料再取り込みAPI
+  - `POST /api/development/rag/reindex`
 
 ## DBで実装済み
 
@@ -115,6 +118,10 @@
 - `conversation_turns`
 - `audio_files`
 - `turn_events`
+- `knowledge_documents`
+- `knowledge_chunks`
+- `knowledge_chunk_embeddings`
+- `turn_rag_references`
 
 設計方針:
 
@@ -124,6 +131,7 @@
 - DBには音声ファイルの参照情報を保存
 - 入力音声は `storage/audio/input/YYYYMMDD`
 - 出力音声は `storage/audio/output/YYYYMMDD`
+- VoiceLink資料、チャンク、Embedding、回答時の参照スナップショットを保存
 
 ## 外部API連携の実装状況
 
@@ -131,20 +139,21 @@
 
 実装済み:
 
-- `ExternalApis:UseDevelopmentMocks` を `true` にすると、実STT/TTS/Geminiを使わずに成功ルートを確認できる
+- `ExternalApis:UseDevelopmentMocks` を `true` にすると、STT/TTS/Geminiを固定応答へ切り替えられる
 - 開発用STTは固定の文字起こしテキストを返す
 - 開発用Geminiは固定の返答テキストを返す
 - 開発用TTSは短い無音WAVを返す
+- RAGは検索結果の正しさを確認する必要があるため、開発用モックへ切り替えない
 
 用途:
 
-- 実APIのURLやAPIキーを入れる前に、録音、音声保存、DB保存、SignalR通知、チャット表示、音声取得・再生の流れを確認する
+- RAG追加前の録音、音声保存、DB保存、SignalR通知、チャット表示、音声取得・再生の確認に使用していた
+- 現在はRAG段階で明確な設定エラーになるため、`UseDevelopmentMocks=true`だけでは会話処理を最後まで完了できない
 
 使い方:
 
 - `STSApp.Backend/appsettings.Development.json` の `ExternalApis` 直下に `"UseDevelopmentMocks": true` を入れる
-- この設定を有効にすると、STT/TTS/Geminiの実URLやAPIキーが空でも、開発用の固定応答で最後まで処理できる
-- 実APIの疎通確認に移る時は `"UseDevelopmentMocks": false` に戻す
+- 実APIとVector RAGを使う現在の通常確認では `"UseDevelopmentMocks": false` にする
 
 ### STT
 
@@ -159,9 +168,9 @@
   - `confidence`
   - `duration`
 
-未設定:
+確認状況:
 
-- 実Base URL
+- 実APIへの音声送信と文字起こしを確認済み
 
 ### Gemini
 
@@ -172,10 +181,10 @@
 - 返答テキストをDB保存
 - SignalRで返答テキスト完了通知
 
-未設定:
+確認状況:
 
-- API key
-- model name
+- 実APIによる返答テキスト生成を確認済み
+- 実際の値はGit管理対象外のローカル設定で管理
 
 ### TTS
 
@@ -189,14 +198,27 @@
   - `beta`
   - `speed`
 - WAV binary response想定
+- HTTP 200でも、実データがWAVとして成立するかを保存前に検証
 - 返答音声を保存
 - `audio_files.kind = output` としてDB保存
 - SignalRで `audioId` を通知
 
-未設定:
+確認状況:
 
-- 実Base URL
-- voicepackなどの実設定
+- 実APIによるWAV生成と自動再生を確認済み
+- 実際の値はGit管理対象外のローカル設定で管理
+
+### Vector RAG
+
+実装済み:
+
+- VoiceLinkの架空資料5件を見出し単位の26チャンクへ分割
+- Gemini Embedding APIで768次元のEmbeddingを生成
+- MySQLへ資料、チャンク、Embeddingを保存
+- ユーザー発話と近い資料を最大3件検索
+- 資料が見つかった場合は資料を根拠としてGeminiへ渡す
+- 資料が見つからない一般質問は一般知識による回答として区別
+- 回答時に使った資料内容を参照スナップショットとして保存
 
 ## Avalonia Desktopで実装済み
 
@@ -212,10 +234,12 @@
   - `assistantTextCompleted`
   - `speechSynthesisCompleted`
   - `turnFailed`
-- PushToTalk
-  - 押下で録音開始
-  - 離すと録音停止
-  - WAVとしてBackendへ送信
+- VADによる連続音声入力
+  - `音声入力開始`を押すとマイク入力の待機を開始
+  - WebRTC VADで発話開始を検知
+  - 一定時間の無音から終話を検知
+  - 1発話をWAVとしてBackendへ自動送信
+  - 返答音声再生後、セッションが有効なら次の発話待機へ戻る
 - macOS AVFoundationによる実マイク録音
   - 16kHz
   - mono
@@ -231,44 +255,37 @@
 - Backendビルド成功
 - Desktopビルド成功
 - Avaloniaアプリ起動確認
-- PushToTalkイベント発火確認
-- STT未設定時に502になることを確認
-- STT未設定時にDBへ失敗ターンが残ることを確認
-- `storage/audio/input/20260715` にWAVが保存されていることを確認
+- VADによる発話開始・終話検知を確認
+- 実STTによる文字起こしを確認
+- Vector RAG検索とGemini返答生成を確認
+- 実TTSによるWAV生成と自動再生を確認
+- 入力音声と出力音声が日付別フォルダへ保存されることを確認
 - DBに以下が保存されることを確認
   - `conversation_turns`
   - `audio_files`
   - `turn_events`
+  - RAG資料、Embedding、参照履歴
 - SignalR通知の元になるイベントがDBに保存されることを確認
+- Backend自動テスト32件成功
+- ソリューション全体のビルドが警告0・エラー0で成功
 
 ## 現在の注意点
 
-- STT/TTS/Geminiの実URLやAPIキーはまだ設定していない
-- STT未設定のため、音声アップロード後は `stt failed` になる
-- `storage/audio/input` のファイルを消しても、DBの `audio_files` 参照は残る
-- 古いDB参照に対して実ファイルが消えている場合、音声取得は失敗する
+- 実URL、APIキー、DBパスワードはGit管理対象外の `appsettings.Development.json` で管理する
+- `UseDevelopmentMocks=true`ではRAGをモック化しないため、現在の会話処理はRAG段階で停止する
+- 過去の手動ファイル削除によって、開発DBには参照先ファイルが存在しない古い音声レコードが残っている
+- プロセス強制終了まで含めた孤立音声・一時ファイルの自動回収は未実装
 - Avaloniaのビルド確認時は、この環境では次の環境変数を付けている
   - `AVALONIA_TELEMETRY_OPTOUT=1`
 
 ## 次回やること
 
-優先度が高いもの:
+現時点で確認・検討する候補:
 
-- `ExternalApis:UseDevelopmentMocks=true` で、実APIなしの成功ルートを確認する
-- `storage/audio/input` と `storage/audio/output` に音声ファイルが保存されることを再確認する
-- 実STT API疎通確認
-- 実Gemini API疎通確認
-- 実TTS API疎通確認
-- STT成功時にユーザー発話がUIへ表示されることを確認
-- Gemini成功時にアシスタント返答がUIへ表示されることを確認
-- TTS成功時に返答音声が再生されることを確認
-
-その後の候補:
-
-- 録音エラー時の表示をさらに分かりやすくする
-- 検証データ削除方法を決める
-- 実マイク録音の安定性確認
-- 音声形式やサンプリングレートがSTT APIの期待と合うか確認
+- 音声アップロードAPIで許可する形式と最大サイズを決める
+- Desktopの再生用一時ファイルを、書き込み失敗時にも削除できるようにする
+- 過去の検証で参照切れになった開発DBの音声レコードを整理する
+- プロセス強制終了時に残る孤立音声・一時ファイルの回収方針を決める
 
 ## 2026-07-16 追加メモ
 

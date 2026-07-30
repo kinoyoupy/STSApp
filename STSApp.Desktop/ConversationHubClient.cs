@@ -16,6 +16,7 @@ namespace STSApp.Desktop;
 public sealed class ConversationHubClient : IAsyncDisposable
 {
     private readonly HubConnection _connection;
+    private Guid? _joinedConversationId;
 
     public ConversationHubClient(string backendBaseUrl)
     {
@@ -34,6 +35,16 @@ public sealed class ConversationHubClient : IAsyncDisposable
             })
             .WithAutomaticReconnect()
             .Build();
+
+        _connection.Reconnected += async _ =>
+        {
+            // SignalRのグループ参加状態は再接続時に作り直す必要があります。
+            // 会話IDを覚えておき、自動再接続後も同じ会話の通知を受け取れるようにします。
+            if (_joinedConversationId is not null)
+            {
+                await JoinConversationCoreAsync(_joinedConversationId.Value, CancellationToken.None);
+            }
+        };
 
         _connection.On<TurnStatusChangedEvent>("turnStatusChanged", value =>
         {
@@ -75,6 +86,35 @@ public sealed class ConversationHubClient : IAsyncDisposable
         {
             await _connection.StartAsync(cancellationToken);
         }
+    }
+
+    public async Task JoinConversationAsync(
+        Guid conversationId,
+        CancellationToken cancellationToken)
+    {
+        _joinedConversationId = conversationId;
+
+        // 初回起動時の接続に失敗した場合、AutomaticReconnectだけでは再開始の契機がありません。
+        // RESTで会話を作れた時点でBackendは利用可能なので、ここで明示的に接続を再試行します。
+        if (_connection.State == HubConnectionState.Disconnected)
+        {
+            await _connection.StartAsync(cancellationToken);
+        }
+
+        if (_connection.State == HubConnectionState.Connected)
+        {
+            await JoinConversationCoreAsync(conversationId, cancellationToken);
+        }
+    }
+
+    private Task JoinConversationCoreAsync(
+        Guid conversationId,
+        CancellationToken cancellationToken)
+    {
+        return _connection.InvokeAsync(
+            "JoinConversation",
+            conversationId,
+            cancellationToken);
     }
 
     public async ValueTask DisposeAsync()
