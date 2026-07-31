@@ -30,15 +30,25 @@
                                Foreground="#657085" />
                 </StackPanel>
 
-                <Button Grid.Column="1"
-                        x:Name="RefreshButton"
-                        Content="会話を同期"
-                        MinWidth="96"
-                        HorizontalContentAlignment="Center"
-                        VerticalContentAlignment="Center"
-                        VerticalAlignment="Center"
-                        ToolTip.Tip="サーバーに保存された会話内容を画面へ読み直します。"
-                        Click="RefreshButton_Click" />
+                <StackPanel Grid.Column="1"
+                            Orientation="Horizontal"
+                            Spacing="8"
+                            VerticalAlignment="Center">
+                    <Button x:Name="ConversationHistoryButton"
+                            Content="会話履歴"
+                            MinWidth="96"
+                            HorizontalContentAlignment="Center"
+                            VerticalContentAlignment="Center"
+                            ToolTip.Tip="保存された会話を選んで表示します。"
+                            Click="ConversationHistoryButton_Click" />
+                    <Button x:Name="RefreshButton"
+                            Content="会話を同期"
+                            MinWidth="96"
+                            HorizontalContentAlignment="Center"
+                            VerticalContentAlignment="Center"
+                            ToolTip.Tip="現在の会話をサーバーから読み直します。"
+                            Click="RefreshButton_Click" />
+                </StackPanel>
             </Grid>
         </Border>
 

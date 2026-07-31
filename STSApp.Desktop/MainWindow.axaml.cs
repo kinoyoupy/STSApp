@@ -6,6 +6,7 @@ using Avalonia.Interactivity;
 using Avalonia.Threading;
 using STSApp.Contracts.Enums;
 using STSApp.Contracts.Events;
+using STSApp.Contracts.Models;
 using System.Collections.Generic;
 using System.Linq;
 
@@ -33,6 +34,8 @@ public partial class MainWindow : Window
     private readonly CancellationTokenSource _windowClosingTokenSource = new();
     private CancellationTokenSource? _playbackCancellationSource;
     private bool _isAudioPlaybackActive;
+    private bool _isCloseConfirmationOpen;
+    private bool _allowWindowClose;
 
     // Backendで作られた会話セッションIDです。
     // 音声アップロード、履歴取得、SignalR通知のフィルタリングで同じIDを使います。
@@ -63,6 +66,7 @@ public partial class MainWindow : Window
         // コンストラクタ内で待ち処理をすると、画面表示が遅くなるためです。
         RegisterSignalREvents();
         Opened += MainWindow_Opened;
+        Closing += MainWindow_Closing;
         Closed += MainWindow_Closed;
     }
 
@@ -76,9 +80,9 @@ public partial class MainWindow : Window
 
     private async void MainWindow_Closed(object? sender, EventArgs e)
     {
-        // 画面が閉じられた後にHTTP通信が続かないよう、キャンセルします。
+        // 削除通知と録音・再生の停止は、Closingイベントで完了させています。
+        // Closedでは画面破棄後に必要なリソースだけを解放します。
         _windowClosingTokenSource.Cancel();
-        _playbackCancellationSource?.Cancel();
         _windowClosingTokenSource.Dispose();
         _chatMessages.Dispose();
         _voiceInputController.StateChanged -= ApplyVoiceInputState;
@@ -90,6 +94,78 @@ public partial class MainWindow : Window
         await _conversationHubClient.DisposeAsync();
     }
 
+    private async void MainWindow_Closing(object? sender, WindowClosingEventArgs e)
+    {
+        if (_allowWindowClose)
+        {
+            return;
+        }
+
+        // 終了前に確認を出すため、いったん通常の終了処理を止めます。
+        e.Cancel = true;
+        if (_isCloseConfirmationOpen)
+        {
+            return;
+        }
+
+        _isCloseConfirmationOpen = true;
+        try
+        {
+            var shouldClose = await new CloseConfirmationDialog().ShowDialog<bool>(this);
+            if (!shouldClose)
+            {
+                return;
+            }
+
+            await PrepareForWindowCloseAsync();
+            _allowWindowClose = true;
+            Close();
+        }
+        finally
+        {
+            _isCloseConfirmationOpen = false;
+        }
+    }
+
+    private async Task PrepareForWindowCloseAsync()
+    {
+        // 音声処理と再生を先に止めます。
+        // その後に削除することで、再生中の音声ファイルを削除処理と競合させません。
+        _playbackCancellationSource?.Cancel();
+        _voiceInputController.StopSessionAndDiscard();
+
+        var playbackTasks = _activeAudioPlaybackTasks.Values.ToArray();
+        if (playbackTasks.Length > 0)
+        {
+            try
+            {
+                await Task.WhenAll(playbackTasks);
+            }
+            catch
+            {
+                // 終了時は再生エラーを画面へ追加できないため、終了処理を続けます。
+            }
+        }
+
+        if (_conversationId is not Guid conversationId)
+        {
+            return;
+        }
+
+        try
+        {
+            // Backendが応答しない場合もアプリ終了を妨げないよう、待機時間を限定します。
+            using var cleanupTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+            await _backendApiClient.DeleteConversationAudioAsync(
+                conversationId,
+                cleanupTimeout.Token);
+        }
+        catch
+        {
+            // 通信できない場合は、次回Backend起動時の整理に任せます。
+        }
+    }
+
     private async void RefreshButton_Click(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
     {
         // 会話を同期は「サーバーに保存された現在の状態」を取り直す操作です。
@@ -97,11 +173,74 @@ public partial class MainWindow : Window
         await RefreshConversationTurnsAsync();
     }
 
+    private async void ConversationHistoryButton_Click(
+        object? sender,
+        Avalonia.Interactivity.RoutedEventArgs e)
+    {
+        if (!_isBackendReady || _voiceInputController.State == VoiceInputState.Processing)
+        {
+            return;
+        }
+
+        try
+        {
+            ConversationHistoryButton.IsEnabled = false;
+            StatusText.Text = "会話履歴を取得中";
+            InputHintText.Text = "保存された会話を読み込んでいます。";
+
+            var conversations = await _backendApiClient.ListConversationsAsync(
+                _windowClosingTokenSource.Token);
+            var dialog = new ConversationHistoryDialog(conversations);
+            var selectedConversation = await dialog.ShowDialog<ConversationDto?>(this);
+
+            if (selectedConversation is not null)
+            {
+                await SelectConversationAsync(selectedConversation);
+            }
+            else
+            {
+                StatusText.Text = "サーバー接続済み";
+                InputHintText.Text = "音声入力開始を押して、話しかけてください。";
+            }
+        }
+        catch (Exception ex)
+        {
+            StatusText.Text = "会話履歴を取得できませんでした";
+            InputHintText.Text = "サーバーの状態を確認してから、もう一度お試しください。";
+            AddErrorMessage($"会話履歴を取得できませんでした: {ex.Message}");
+        }
+        finally
+        {
+            ConversationHistoryButton.IsEnabled = _isBackendReady
+                && _voiceInputController.State != VoiceInputState.Processing;
+        }
+    }
+
+    private async Task SelectConversationAsync(ConversationDto conversation)
+    {
+        // 選択した会話IDを以降の音声送信・履歴取得・SignalR通知の基準にします。
+        // これにより、過去の会話を表示した後も、その会話へ続けて発話できます。
+        _conversationId = conversation.Id;
+        _completedAudioPlaybackIds.Clear();
+
+        await TryJoinConversationNotificationsAsync(conversation.Id);
+        var synchronized = await RefreshConversationTurnsAsync(showSyncMessage: false);
+        if (!synchronized)
+        {
+            return;
+        }
+
+        StatusText.Text = "会話を表示中";
+        InputHintText.Text = "この会話へ続けて話しかけられます。";
+    }
+
     private void VoiceInputButton_Click(object? sender, RoutedEventArgs e)
     {
         if (_isAudioPlaybackActive)
         {
             _playbackCancellationSource?.Cancel();
+            StatusText.Text = "返答音声を停止しました";
+            InputHintText.Text = "次の発話を受け付ける準備をしています。";
             return;
         }
 
@@ -164,6 +303,11 @@ public partial class MainWindow : Window
                 StatusText.Text = "音声入力開始失敗";
                 InputHintText.Text = "macOSのマイク権限と入力デバイスを確認し、Desktopアプリを再起動してください。";
                 AddErrorMessage($"音声入力の待機を開始できませんでした: {error.Message}");
+                break;
+            case VoiceInputSessionErrorKind.NoAudioFrame:
+                StatusText.Text = "マイク入力開始失敗";
+                InputHintText.Text = "入力デバイスを確認して、音声入力をもう一度開始してください。";
+                AddErrorMessage($"マイク入力を開始できませんでした: {error.Message}");
                 break;
             case VoiceInputSessionErrorKind.CaptureStart:
                 StatusText.Text = "録音保存開始失敗";
@@ -326,6 +470,57 @@ public partial class MainWindow : Window
         }
     }
 
+    private void HandleSignalRReconnecting(Exception? exception)
+    {
+        if (_windowClosingTokenSource.IsCancellationRequested)
+        {
+            return;
+        }
+
+        _isBackendReady = false;
+        ApplyVoiceInputState(_voiceInputController.State);
+        StatusText.Text = "サーバー再接続中";
+        InputHintText.Text = "サーバーへの再接続を試みています。";
+    }
+
+    private async Task HandleSignalRReconnectedAsync()
+    {
+        if (_windowClosingTokenSource.IsCancellationRequested || _conversationId is null)
+        {
+            return;
+        }
+
+        _isBackendReady = true;
+        ApplyVoiceInputState(_voiceInputController.State);
+        _chatMessages.ClearDesktopErrors();
+        StatusText.Text = "サーバー再接続完了";
+        InputHintText.Text = "会話を同期しています。";
+
+        // 再接続中に取り逃した通知があっても、DBに保存済みの状態を読み直して補正します。
+        var synchronized = await RefreshConversationTurnsAsync(showSyncMessage: false);
+        if (!synchronized)
+        {
+            return;
+        }
+
+        StatusText.Text = "サーバー接続済み";
+        InputHintText.Text = "音声入力開始を押して、話しかけてください。";
+    }
+
+    private void HandleSignalRClosed(Exception? exception)
+    {
+        if (_windowClosingTokenSource.IsCancellationRequested)
+        {
+            return;
+        }
+
+        _isBackendReady = false;
+        ApplyVoiceInputState(_voiceInputController.State);
+        StatusText.Text = "サーバー接続切断";
+        InputHintText.Text = "サーバーを確認してから、会話を同期してください。";
+        AddErrorMessage("サーバーとの接続が切断されました。サーバーを確認してください。");
+    }
+
     private void RegisterSignalREvents()
     {
         // SignalRのイベントはUIスレッドとは別の場所で呼ばれることがあります。
@@ -401,6 +596,21 @@ public partial class MainWindow : Window
                 StatusText.Text = "処理失敗";
                 InputHintText.Text = "「会話を同期」を押してサーバー側の状態を確認してください。";
             });
+        };
+
+        _conversationHubClient.Reconnecting += exception =>
+        {
+            RunOnUiThread(() => HandleSignalRReconnecting(exception));
+        };
+
+        _conversationHubClient.Reconnected += () =>
+        {
+            RunOnUiThread(() => _ = HandleSignalRReconnectedAsync());
+        };
+
+        _conversationHubClient.ConnectionClosed += exception =>
+        {
+            RunOnUiThread(() => HandleSignalRClosed(exception));
         };
     }
 
@@ -581,14 +791,14 @@ public partial class MainWindow : Window
         };
     }
 
-    private async Task RefreshConversationTurnsAsync(bool showSyncMessage = true)
+    private async Task<bool> RefreshConversationTurnsAsync(bool showSyncMessage = true)
     {
         try
         {
             if (_conversationId is null)
             {
                 await CreateConversationAsync();
-                return;
+                return true;
             }
 
             SetBusyState("会話を同期中...");
@@ -607,12 +817,17 @@ public partial class MainWindow : Window
             {
                 InputHintText.Text = "会話を同期しました。";
             }
+
+            return true;
         }
         catch (Exception ex)
         {
+            _isBackendReady = false;
+            ApplyVoiceInputState(_voiceInputController.State);
             StatusText.Text = "会話の同期に失敗しました";
             InputHintText.Text = "サーバーの状態を確認してから、もう一度お試しください。";
             AddErrorMessage($"会話を同期できませんでした。サーバーの状態を確認してください: {ex.Message}");
+            return false;
         }
     }
 
@@ -666,6 +881,9 @@ public partial class MainWindow : Window
         // 処理中にマイクを開くと、どの発話への返答かが混ざってしまうためです。
         VoiceInputButton.IsEnabled = _isBackendReady
             && (state != VoiceInputState.Processing || _isAudioPlaybackActive);
+
+        ConversationHistoryButton.IsEnabled = _isBackendReady
+            && state != VoiceInputState.Processing;
 
         VoiceInputButton.Content = state switch
         {

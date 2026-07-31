@@ -15,6 +15,8 @@ public sealed class VoiceInputSessionController : IDisposable
     private readonly WebRtcVoiceActivityDetector _voiceActivityDetector = new();
     private readonly VoiceEndpointDetector _voiceEndpointDetector = new();
     private static readonly TimeSpan FirstAudioFrameTimeout = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan FirstAudioFrameRetryDelay = TimeSpan.FromMilliseconds(200);
+    private const int MaxFirstAudioFrameRetries = 1;
     private bool _isCompletingUtterance;
     private CancellationTokenSource? _frameWatchdogCancellation;
 
@@ -109,7 +111,7 @@ public sealed class VoiceInputSessionController : IDisposable
         _voiceActivityDetector.Dispose();
     }
 
-    private void StartListeningCore()
+    private void StartListeningCore(int startupAttempt = 0)
     {
         CancelFrameWatchdog();
 
@@ -124,7 +126,7 @@ public sealed class VoiceInputSessionController : IDisposable
 
             var watchdogCancellation = new CancellationTokenSource();
             _frameWatchdogCancellation = watchdogCancellation;
-            _ = MonitorFirstAudioFrameAsync(watchdogCancellation);
+            _ = MonitorFirstAudioFrameAsync(watchdogCancellation, startupAttempt);
         }
         catch (Exception exception)
         {
@@ -244,7 +246,9 @@ public sealed class VoiceInputSessionController : IDisposable
         }
     }
 
-    private async Task MonitorFirstAudioFrameAsync(CancellationTokenSource watchdogCancellation)
+    private async Task MonitorFirstAudioFrameAsync(
+        CancellationTokenSource watchdogCancellation,
+        int startupAttempt)
     {
         try
         {
@@ -270,6 +274,19 @@ public sealed class VoiceInputSessionController : IDisposable
 
             _frameWatchdogCancellation = null;
             watchdogCancellation.Dispose();
+
+            if (startupAttempt < MaxFirstAudioFrameRetries)
+            {
+                // macOSの初回だけ入力デバイスの準備に時間がかかることがあります。
+                // ここで即座にエラーにすると、権限が許可されていても利用者に誤った案内を出すため、
+                // 録音エンジンを一度作り直してから、同じ入力開始を1回だけ自動で再試行します。
+                _voiceActivityDetector.EndRecording();
+                _voiceEndpointDetector.EndRecording();
+                TryStopAndDiscard();
+                _ = RetryListeningAfterStartupDelayAsync(startupAttempt + 1);
+                return;
+            }
+
             SessionEnabled = false;
             _isCompletingUtterance = false;
             _voiceActivityDetector.EndRecording();
@@ -277,9 +294,20 @@ public sealed class VoiceInputSessionController : IDisposable
             TryStopAndDiscard();
             SetState(VoiceInputState.Error);
             ErrorOccurred?.Invoke(new VoiceInputSessionError(
-                VoiceInputSessionErrorKind.Start,
-                "音声フレームを受信できませんでした。macOSのマイク権限、入力デバイスの接続状態を確認し、Desktopアプリを再起動してください。"));
+                VoiceInputSessionErrorKind.NoAudioFrame,
+                "マイク入力を開始できませんでした。入力デバイスを確認して、もう一度お試しください。"));
         });
+    }
+
+    private async Task RetryListeningAfterStartupDelayAsync(int startupAttempt)
+    {
+        await Task.Delay(FirstAudioFrameRetryDelay);
+
+        // 待機中に利用者が停止した場合は、再試行して録音を勝手に再開しません。
+        if (SessionEnabled && State == VoiceInputState.Listening)
+        {
+            StartListeningCore(startupAttempt);
+        }
     }
 
     private void CancelFrameWatchdog()
@@ -306,6 +334,7 @@ public enum VoiceInputSessionActivity
 public enum VoiceInputSessionErrorKind
 {
     Start,
+    NoAudioFrame,
     CaptureStart,
     Finalize,
     Stop

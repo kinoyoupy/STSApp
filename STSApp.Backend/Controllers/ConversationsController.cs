@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Mvc;
 using STSApp.Backend.Repositories;
 using STSApp.Backend.Services;
+using STSApp.Backend.Services.Storage;
 using STSApp.Contracts.Models;
 using STSApp.Contracts.Requests;
 using STSApp.Contracts.Responses;
@@ -18,17 +19,20 @@ public sealed class ConversationsController : ControllerBase
     private readonly IConversationRepository _repository;
     private readonly IConversationWorkflow _conversationWorkflow;
     private readonly IHostApplicationLifetime _applicationLifetime;
+    private readonly IAudioFileCleanupService _audioFileCleanupService;
     private readonly ILogger<ConversationsController> _logger;
 
     public ConversationsController(
         IConversationRepository repository,
         IConversationWorkflow conversationWorkflow,
         IHostApplicationLifetime applicationLifetime,
+        IAudioFileCleanupService audioFileCleanupService,
         ILogger<ConversationsController> logger)
     {
         _repository = repository;
         _conversationWorkflow = conversationWorkflow;
         _applicationLifetime = applicationLifetime;
+        _audioFileCleanupService = audioFileCleanupService;
         _logger = logger;
     }
 
@@ -123,5 +127,25 @@ public sealed class ConversationsController : ControllerBase
                 detail: "音声対話の処理を完了できませんでした。少し時間を置いて再度お試しください。",
                 statusCode: StatusCodes.Status502BadGateway);
         }
+    }
+
+    [HttpDelete("{conversationId:guid}/audio")]
+    public async Task<IActionResult> DeleteConversationAudio(
+        Guid conversationId,
+        CancellationToken cancellationToken)
+    {
+        if (!await _repository.ConversationExistsAsync(conversationId, cancellationToken))
+        {
+            return Problem(
+                title: "会話セッションが見つかりません。",
+                detail: "指定されたconversationIdに対応する会話セッションは存在しません。",
+                statusCode: StatusCodes.Status404NotFound);
+        }
+
+        await _audioFileCleanupService.CleanupConversationAsync(
+            conversationId,
+            cancellationToken);
+
+        return NoContent();
     }
 }
