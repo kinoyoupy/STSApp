@@ -2,6 +2,7 @@ using System;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
+using System.Diagnostics;
 
 namespace STSApp.Desktop;
 
@@ -24,6 +25,8 @@ public sealed class ContinuousAudioRecorder : IDisposable
     private bool _isListening;
     private bool _isCapturingAudio;
     private int _capturedFrameCount;
+    private string? _callbackErrorMessage;
+    private volatile bool _isDisposed;
 
     public ContinuousAudioRecorder()
     {
@@ -64,6 +67,7 @@ public sealed class ContinuousAudioRecorder : IDisposable
         }
 
         Interlocked.Exchange(ref _capturedFrameCount, 0);
+        Interlocked.Exchange(ref _callbackErrorMessage, null);
 
         var errorBuffer = new byte[1024];
         if (!NativeMethods.CheckMicrophonePermission(errorBuffer))
@@ -167,6 +171,24 @@ public sealed class ContinuousAudioRecorder : IDisposable
 
     public void Dispose()
     {
+        if (_isDisposed)
+        {
+            return;
+        }
+
+        _isDisposed = true;
+        if (_isListening)
+        {
+            try
+            {
+                StopNative();
+            }
+            catch (Exception exception)
+            {
+                Trace.WriteLine($"ContinuousAudioRecorder stop during dispose failed: {exception.GetType().Name}");
+            }
+        }
+
         _isListening = false;
         _isCapturingAudio = false;
 
@@ -189,13 +211,25 @@ public sealed class ContinuousAudioRecorder : IDisposable
             return;
         }
 
-        var selfHandle = GCHandle.FromIntPtr(context);
-        if (selfHandle.Target is not ContinuousAudioRecorder recorder)
+        ContinuousAudioRecorder? recorder = null;
+        try
         {
-            return;
-        }
+            var selfHandle = GCHandle.FromIntPtr(context);
+            if (selfHandle.Target is not ContinuousAudioRecorder resolvedRecorder
+                || resolvedRecorder._isDisposed)
+            {
+                return;
+            }
 
-        recorder.HandleFrameCaptured(samples, sampleCount);
+            recorder = resolvedRecorder;
+            recorder.HandleFrameCaptured(samples, sampleCount);
+        }
+        catch (Exception exception)
+        {
+            // reverse P/Invokeコールバックから例外を外へ出すと.NETランタイムが
+            // プロセスをSIGABRTで停止するため、録音停止時にUIへ返せる形で保持します。
+            recorder?.RememberCallbackError(exception);
+        }
     }
 
     private void HandleFrameCaptured(IntPtr samples, int sampleCount)
@@ -220,11 +254,22 @@ public sealed class ContinuousAudioRecorder : IDisposable
         _isListening = false;
         _isCapturingAudio = false;
 
-        if (!NativeMethods.Stop(_nativeRecorder))
+        var stopped = NativeMethods.Stop(_nativeRecorder);
+        var callbackError = Interlocked.Exchange(ref _callbackErrorMessage, null);
+        if (!stopped || callbackError is not null)
         {
-            throw new InvalidOperationException(NativeMethods.GetLastError(_nativeRecorder)
+            throw new InvalidOperationException(callbackError
+                ?? NativeMethods.GetLastError(_nativeRecorder)
                 ?? "macOSの連続録音を停止できませんでした。");
         }
+    }
+
+    private void RememberCallbackError(Exception exception)
+    {
+        Interlocked.CompareExchange(
+            ref _callbackErrorMessage,
+            $"音声フレーム処理に失敗しました ({exception.GetType().Name})。",
+            null);
     }
 
     private static class NativeMethods

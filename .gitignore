@@ -32,3 +32,6 @@ STSApp.Backend/storage/audio/
 
 # macOS native build artifacts
 *.dSYM/
+
+# ローカルの実機確認記録
+/# STSシステム完成後の動作確認.md

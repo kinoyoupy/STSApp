@@ -40,14 +40,18 @@ public sealed class ExternalApiErrorPrivacyTests
             CreateFailingHttpClient(),
             Microsoft.Extensions.Options.Options.Create(CreateOptions()));
 
-        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            client.GenerateReplyAsync(
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+        {
+            await foreach (var _ in client.StreamReplyAsync(
                 new GeminiReplyRequest(
                     "質問",
                     [],
                     STSApp.Contracts.Enums.AnswerBasis.GeneralKnowledge,
                     []),
-                CancellationToken.None));
+                CancellationToken.None))
+            {
+            }
+        });
 
         Assert.DoesNotContain(PrivateResponseBody, exception.Message);
     }

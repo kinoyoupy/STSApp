@@ -20,6 +20,7 @@ public sealed class ChatMessageListController : IDisposable
     private readonly StackPanel _messagesPanel;
     private readonly ScrollViewer _scrollViewer;
     private readonly ObservableCollection<ChatMessageItem> _messages = new();
+    private readonly Dictionary<Guid, AssistantTextChunkBuffer> _assistantTextChunks = new();
     private readonly Border _messageEndSpacer = CreateMessageEndSpacer();
 
     public ChatMessageListController(
@@ -65,7 +66,29 @@ public sealed class ChatMessageListController : IDisposable
         Guid? turnId = null,
         AnswerBasis? answerBasis = null)
     {
+        if (turnId is Guid id)
+        {
+            GetOrCreateAssistantTextBuffer(id).FinalizeText();
+            UpsertAssistantMessage(text, id, answerBasis);
+            return;
+        }
+
         AddMessage(ChatMessageItem.Assistant(text, turnId, answerBasis));
+    }
+
+    public void AppendAssistantMessageChunk(Guid turnId, int sequence, string text)
+    {
+        var chunks = GetOrCreateAssistantTextBuffer(turnId);
+        var assembledText = chunks.Add(sequence, text);
+        if (assembledText is not null)
+        {
+            UpsertAssistantMessage(assembledText, turnId, null);
+        }
+    }
+
+    public void ResetStreamingState()
+    {
+        _assistantTextChunks.Clear();
     }
 
     public void ClearDesktopErrors()
@@ -193,6 +216,50 @@ public sealed class ChatMessageListController : IDisposable
         // 終端領域を常に最後に残すため、新しいカードはその直前へ挿入します。
         var spacerIndex = Math.Max(0, _messagesPanel.Children.Count - 1);
         _messagesPanel.Children.Insert(spacerIndex, CreateMessageCard(message));
+        ScrollToLatestMessage();
+    }
+
+    private int FindAssistantMessageIndex(Guid turnId)
+    {
+        for (var index = 0; index < _messages.Count; index++)
+        {
+            var message = _messages[index];
+            if (message.TurnId == turnId && message.Speaker == "アシスタント")
+            {
+                return index;
+            }
+        }
+
+        return -1;
+    }
+
+    private AssistantTextChunkBuffer GetOrCreateAssistantTextBuffer(Guid turnId)
+    {
+        if (!_assistantTextChunks.TryGetValue(turnId, out var buffer))
+        {
+            buffer = new AssistantTextChunkBuffer();
+            _assistantTextChunks.Add(turnId, buffer);
+        }
+
+        return buffer;
+    }
+
+    private void UpsertAssistantMessage(string text, Guid turnId, AnswerBasis? answerBasis)
+    {
+        var existingIndex = FindAssistantMessageIndex(turnId);
+        if (existingIndex >= 0)
+        {
+            ReplaceMessageAt(existingIndex, ChatMessageItem.Assistant(text, turnId, answerBasis));
+            return;
+        }
+
+        AddMessage(ChatMessageItem.Assistant(text, turnId, answerBasis));
+    }
+
+    private void ReplaceMessageAt(int index, ChatMessageItem message)
+    {
+        _messages[index] = message;
+        _messagesPanel.Children[index] = CreateMessageCard(message);
         ScrollToLatestMessage();
     }
 

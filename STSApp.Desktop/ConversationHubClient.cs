@@ -84,6 +84,16 @@ public sealed class ConversationHubClient : IAsyncDisposable
             AssistantTextCompleted?.Invoke(value);
         });
 
+        _connection.On<AssistantTextChunkGeneratedEvent>("assistantTextChunkGenerated", value =>
+        {
+            AssistantTextChunkGenerated?.Invoke(value);
+        });
+
+        _connection.On<SpeechSynthesisChunkCompletedEvent>("speechSynthesisChunkCompleted", value =>
+        {
+            SpeechSynthesisChunkCompleted?.Invoke(value);
+        });
+
         _connection.On<SpeechSynthesisCompletedEvent>("speechSynthesisCompleted", value =>
         {
             SpeechSynthesisCompleted?.Invoke(value);
@@ -98,6 +108,8 @@ public sealed class ConversationHubClient : IAsyncDisposable
     public event Action<TurnStatusChangedEvent>? TurnStatusChanged;
     public event Action<TranscriptionCompletedEvent>? TranscriptionCompleted;
     public event Action<AssistantTextCompletedEvent>? AssistantTextCompleted;
+    public event Action<AssistantTextChunkGeneratedEvent>? AssistantTextChunkGenerated;
+    public event Action<SpeechSynthesisChunkCompletedEvent>? SpeechSynthesisChunkCompleted;
     public event Action<SpeechSynthesisCompletedEvent>? SpeechSynthesisCompleted;
     public event Action<TurnFailedEvent>? TurnFailed;
     public event Action<Exception?>? Reconnecting;

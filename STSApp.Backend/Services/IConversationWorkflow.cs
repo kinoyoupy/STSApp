@@ -14,8 +14,8 @@ public interface IConversationWorkflow
 
 /// <summary>
 /// 1ターンの処理結果です。
-/// 出力音声IDも返すことで、SignalR通知を取り逃したDesktopがREST応答から音声を取得できます。
+/// 出力音声IDを再生順に返すことで、SignalR通知を取り逃したDesktopがREST応答から音声を取得できます。
 /// </summary>
 public sealed record ConversationTurnProcessingResult(
     Guid TurnId,
-    Guid OutputAudioId);
+    IReadOnlyList<Guid> OutputAudioIds);

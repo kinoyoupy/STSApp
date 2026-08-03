@@ -1,4 +1,6 @@
 using Microsoft.AspNetCore.SignalR;
+using System.Text;
+using System.Threading.Channels;
 using STSApp.Backend.Hubs;
 using STSApp.Backend.Repositories;
 using STSApp.Backend.Services.External;
@@ -203,8 +205,8 @@ public sealed class ConversationWorkflow : IConversationWorkflow
 
             currentStage = ProcessingStage.Gemini;
 
-            // Gemini: STTで得たユーザー発話と直近履歴を使って、AI返答テキストを生成します。
-            // 初期版ではストリーミングではなく、返答テキストが完成してから通知します。
+            // Geminiの差分を文単位へまとめ、完成した文からTTSへ流します。
+            // Gemini全文の完成とTTSを直列に待たないことで、最初の音声を早く再生できます。
             await AddEventAndNotifyAsync(
                 conversationId,
                 turn.Id,
@@ -220,109 +222,28 @@ public sealed class ConversationWorkflow : IConversationWorkflow
                 maxTurns: 6,
                 cancellationToken);
 
-            var geminiStartedAt = DateTime.UtcNow;
-            var assistantText = await _geminiClient.GenerateReplyAsync(
+            var streamingResult = await StreamReplyAndSynthesizeAsync(
+                conversationId,
+                turn.Id,
                 new GeminiReplyRequest(
                     userText,
                     recentTurns,
                     ragResult.AnswerBasis,
                     ragResult.References),
-                cancellationToken);
-            var geminiDurationMs = (int)(DateTime.UtcNow - geminiStartedAt).TotalMilliseconds;
-
-            await _repository.UpdateAssistantTextAsync(
-                turn.Id,
-                assistantText,
                 ragResult.AnswerBasis,
                 cancellationToken);
 
-            await AddEventAndNotifyAsync(
-                conversationId,
-                turn.Id,
-                ProcessingStage.Gemini,
-                TurnEventType.Completed,
-                "Gemini応答生成が完了しました。",
-                geminiDurationMs,
-                cancellationToken);
+            await _repository.MarkTurnCompletedAsync(turn.Id, cancellationToken);
 
             await TryNotifyAsync(
                 conversationId,
-                "assistantTextCompleted",
-                new AssistantTextCompletedEvent(conversationId, turn.Id, assistantText, ragResult.AnswerBasis),
+                "speechSynthesisCompleted",
+                new SpeechSynthesisCompletedEvent(conversationId, turn.Id, streamingResult.OutputAudioIds),
                 cancellationToken);
 
-            currentStage = ProcessingStage.Tts;
-
-            // TTS: Geminiが作った返答テキストを音声に変換します。
-            // テキストは先にUIへ出し、音声は生成が終わってからaudioIdを通知します。
-            await AddEventAndNotifyAsync(
-                conversationId,
+            return new ConversationTurnProcessingResult(
                 turn.Id,
-                ProcessingStage.Tts,
-                TurnEventType.Started,
-                "TTS音声生成を開始しました。",
-                null,
-                cancellationToken);
-
-            var ttsStartedAt = DateTime.UtcNow;
-            var generatedSpeech = await _ttsClient.SynthesizeAsync(
-                assistantText,
-                cancellationToken);
-
-            await using (generatedSpeech.AudioStream)
-            {
-                // 返答音声も入力音声と同じく、実ファイルはstorage/audio/output/...へ保存し、
-                // DBには参照情報を保存します。
-                var storedOutputAudio = await _audioFileStorage.SaveOutputAudioAsync(
-                    turn.Id,
-                    generatedSpeech.AudioStream,
-                    generatedSpeech.MimeType,
-                    generatedSpeech.FileExtension,
-                    cancellationToken);
-
-                AudioFileDto outputAudio;
-                try
-                {
-                    outputAudio = await _repository.AddAudioFileAsync(
-                        turn.Id,
-                        AudioFileKind.Output,
-                        storedOutputAudio.FilePath,
-                        storedOutputAudio.MimeType,
-                        storedOutputAudio.FileSizeBytes,
-                        cancellationToken);
-                }
-                catch
-                {
-                    // TTS音声も、DB登録前に失敗した時だけ補償削除します。
-                    // 登録後に後続処理が失敗した音声は、失敗ターンの記録として残します。
-                    await TryDeleteUnregisteredAudioAsync(turn.Id, storedOutputAudio.FilePath);
-                    throw;
-                }
-
-                var ttsDurationMs = (int)(DateTime.UtcNow - ttsStartedAt).TotalMilliseconds;
-
-                await AddEventAndNotifyAsync(
-                    conversationId,
-                    turn.Id,
-                    ProcessingStage.Tts,
-                    TurnEventType.Completed,
-                    "TTS音声生成が完了しました。",
-                    ttsDurationMs,
-                    cancellationToken);
-
-                await _repository.MarkTurnCompletedAsync(turn.Id, cancellationToken);
-
-                // AvaloniaはこのaudioIdを使って GET /api/audio/{audioId} を呼び、音声を取得・再生します。
-                await TryNotifyAsync(
-                    conversationId,
-                    "speechSynthesisCompleted",
-                    new SpeechSynthesisCompletedEvent(conversationId, turn.Id, outputAudio.Id),
-                    cancellationToken);
-
-                return new ConversationTurnProcessingResult(
-                    turn.Id,
-                    outputAudio.Id);
-            }
+                streamingResult.OutputAudioIds);
         }
         catch (Exception ex)
         {
@@ -330,7 +251,9 @@ public sealed class ConversationWorkflow : IConversationWorkflow
             // STT・RAG・Gemini・TTSのどこで失敗したかをDBとSignalRへ同じ意味で残せます。
             var failureStage = DatabaseFailureDetector.IsDatabaseFailure(ex)
                 ? ProcessingStage.Database
-                : currentStage;
+                : ex is StageProcessingException stageException
+                    ? stageException.Stage
+                    : currentStage;
             var userMessage = failureStage switch
             {
                 ProcessingStage.Database => "会話データをDBへ保存できませんでした。",
@@ -350,6 +273,303 @@ public sealed class ConversationWorkflow : IConversationWorkflow
 
             throw;
         }
+    }
+
+    private async Task<StreamingTurnResult> StreamReplyAndSynthesizeAsync(
+        Guid conversationId,
+        Guid turnId,
+        GeminiReplyRequest replyRequest,
+        AnswerBasis answerBasis,
+        CancellationToken cancellationToken)
+    {
+        var sentenceChannel = Channel.CreateUnbounded<SpeechSegment>(new UnboundedChannelOptions
+        {
+            SingleReader = true,
+            SingleWriter = true
+        });
+        using var pipelineCancellationSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var pipelineToken = pipelineCancellationSource.Token;
+        var fullText = new StringBuilder();
+        var outputAudioIds = new List<Guid>();
+        var geminiStartedAt = DateTime.UtcNow;
+        var assistantTextPersisted = false;
+
+        var ttsTask = ConsumeSpeechSegmentsAsync();
+        var geminiTask = ProduceSpeechSegmentsAsync();
+
+        try
+        {
+            await Task.WhenAll(geminiTask, ttsTask);
+        }
+        catch
+        {
+            pipelineCancellationSource.Cancel();
+            sentenceChannel.Writer.TryComplete();
+
+            if (!assistantTextPersisted && !string.IsNullOrWhiteSpace(fullText.ToString()))
+            {
+                await TryPersistPartialAssistantTextAsync(
+                    turnId,
+                    fullText.ToString().Trim(),
+                    answerBasis);
+            }
+
+            if (ttsTask.IsFaulted)
+            {
+                var exception = UnwrapStageException(ttsTask.Exception!.GetBaseException());
+                if (DatabaseFailureDetector.IsDatabaseFailure(exception))
+                {
+                    throw exception;
+                }
+
+                throw new StageProcessingException(
+                    ProcessingStage.Tts,
+                    exception);
+            }
+
+            if (geminiTask.IsFaulted)
+            {
+                var exception = UnwrapStageException(geminiTask.Exception!.GetBaseException());
+                if (DatabaseFailureDetector.IsDatabaseFailure(exception))
+                {
+                    throw exception;
+                }
+
+                throw new StageProcessingException(
+                    ProcessingStage.Gemini,
+                    exception);
+            }
+
+            throw;
+        }
+
+        return new StreamingTurnResult(outputAudioIds.ToArray());
+
+        async Task ProduceSpeechSegmentsAsync()
+        {
+            var segmenter = new StreamingSentenceSegmenter();
+            var sequence = 0;
+            var firstSentenceRecorded = false;
+
+            try
+            {
+                await foreach (var delta in _geminiClient.StreamReplyAsync(replyRequest, pipelineToken))
+                {
+                    fullText.Append(delta);
+                    foreach (var sentence in segmenter.Append(delta))
+                    {
+                        await PublishSentenceAsync(sentence, sequence++);
+                    }
+                }
+
+                foreach (var sentence in segmenter.Complete())
+                {
+                    await PublishSentenceAsync(sentence, sequence++);
+                }
+
+                var assistantText = fullText.ToString().Trim();
+                if (sequence == 0 || string.IsNullOrWhiteSpace(assistantText))
+                {
+                    throw new InvalidOperationException("Gemini API response did not contain output text.");
+                }
+
+                await _repository.UpdateAssistantTextAsync(
+                    turnId,
+                    assistantText,
+                    answerBasis,
+                    pipelineToken);
+                assistantTextPersisted = true;
+
+                var geminiDurationMs = (int)(DateTime.UtcNow - geminiStartedAt).TotalMilliseconds;
+                await AddEventAndNotifyAsync(
+                    conversationId,
+                    turnId,
+                    ProcessingStage.Gemini,
+                    TurnEventType.Completed,
+                    "Gemini応答生成が完了しました。",
+                    geminiDurationMs,
+                    pipelineToken);
+
+                await TryNotifyAsync(
+                    conversationId,
+                    "assistantTextCompleted",
+                    new AssistantTextCompletedEvent(conversationId, turnId, assistantText, answerBasis),
+                    pipelineToken);
+
+                sentenceChannel.Writer.TryComplete();
+            }
+            catch (OperationCanceledException) when (pipelineToken.IsCancellationRequested)
+            {
+                sentenceChannel.Writer.TryComplete();
+                throw;
+            }
+            catch (Exception exception)
+            {
+                sentenceChannel.Writer.TryComplete();
+                pipelineCancellationSource.Cancel();
+                throw new StageProcessingException(ProcessingStage.Gemini, exception);
+            }
+
+            async Task PublishSentenceAsync(string sentence, int sentenceSequence)
+            {
+                if (!firstSentenceRecorded)
+                {
+                    firstSentenceRecorded = true;
+                    var firstSentenceDurationMs = (int)(DateTime.UtcNow - geminiStartedAt).TotalMilliseconds;
+                    await AddEventAndNotifyAsync(
+                        conversationId,
+                        turnId,
+                        ProcessingStage.Gemini,
+                        TurnEventType.Info,
+                        "Geminiの最初の文が確定しました。",
+                        firstSentenceDurationMs,
+                        pipelineToken);
+                }
+
+                await TryNotifyAsync(
+                    conversationId,
+                    "assistantTextChunkGenerated",
+                    new AssistantTextChunkGeneratedEvent(
+                        conversationId,
+                        turnId,
+                        sentenceSequence,
+                        sentence),
+                    pipelineToken);
+
+                await sentenceChannel.Writer.WriteAsync(
+                    new SpeechSegment(sentenceSequence, sentence),
+                    pipelineToken);
+            }
+        }
+
+        async Task ConsumeSpeechSegmentsAsync()
+        {
+            DateTime? ttsStartedAt = null;
+
+            try
+            {
+                await foreach (var segment in sentenceChannel.Reader.ReadAllAsync(pipelineToken))
+                {
+                    if (ttsStartedAt is null)
+                    {
+                        ttsStartedAt = DateTime.UtcNow;
+                        await AddEventAndNotifyAsync(
+                            conversationId,
+                            turnId,
+                            ProcessingStage.Tts,
+                            TurnEventType.Started,
+                            "TTS音声生成を開始しました。",
+                            null,
+                            pipelineToken);
+                    }
+
+                    var chunkStartedAt = DateTime.UtcNow;
+                    var generatedSpeech = await _ttsClient.SynthesizeAsync(segment.Text, pipelineToken);
+                    await using (generatedSpeech.AudioStream)
+                    {
+                        var storedOutputAudio = await _audioFileStorage.SaveOutputAudioAsync(
+                            turnId,
+                            generatedSpeech.AudioStream,
+                            generatedSpeech.MimeType,
+                            generatedSpeech.FileExtension,
+                            pipelineToken);
+
+                        AudioFileDto outputAudio;
+                        try
+                        {
+                            outputAudio = await _repository.AddAudioFileAsync(
+                                turnId,
+                                AudioFileKind.Output,
+                                storedOutputAudio.FilePath,
+                                storedOutputAudio.MimeType,
+                                storedOutputAudio.FileSizeBytes,
+                                pipelineToken);
+                        }
+                        catch
+                        {
+                            await TryDeleteUnregisteredAudioAsync(turnId, storedOutputAudio.FilePath);
+                            throw;
+                        }
+
+                        outputAudioIds.Add(outputAudio.Id);
+                        var chunkDurationMs = (int)(DateTime.UtcNow - chunkStartedAt).TotalMilliseconds;
+                        await AddEventAndNotifyAsync(
+                            conversationId,
+                            turnId,
+                            ProcessingStage.Tts,
+                            TurnEventType.Info,
+                            $"TTS音声チャンク{segment.Sequence + 1}件目が完成しました。",
+                            chunkDurationMs,
+                            pipelineToken);
+
+                        await TryNotifyAsync(
+                            conversationId,
+                            "speechSynthesisChunkCompleted",
+                            new SpeechSynthesisChunkCompletedEvent(
+                                conversationId,
+                                turnId,
+                                segment.Sequence,
+                                outputAudio.Id),
+                            pipelineToken);
+                    }
+                }
+
+                if (ttsStartedAt is not null)
+                {
+                    var ttsDurationMs = (int)(DateTime.UtcNow - ttsStartedAt.Value).TotalMilliseconds;
+                    await AddEventAndNotifyAsync(
+                        conversationId,
+                        turnId,
+                        ProcessingStage.Tts,
+                        TurnEventType.Completed,
+                        "TTS音声生成が完了しました。",
+                        ttsDurationMs,
+                        pipelineToken);
+                }
+            }
+            catch (OperationCanceledException) when (pipelineToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception exception)
+            {
+                pipelineCancellationSource.Cancel();
+                throw new StageProcessingException(ProcessingStage.Tts, exception);
+            }
+        }
+    }
+
+    private async Task TryPersistPartialAssistantTextAsync(
+        Guid turnId,
+        string assistantText,
+        AnswerBasis answerBasis)
+    {
+        try
+        {
+            using var persistenceCancellationSource = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            await _repository.UpdateAssistantTextAsync(
+                turnId,
+                assistantText,
+                answerBasis,
+                persistenceCancellationSource.Token);
+        }
+        catch (Exception exception)
+        {
+            _logger.LogWarning(
+                "Could not persist partial assistant text for turn {TurnId}. ExceptionType={ExceptionType}.",
+                turnId,
+                exception.GetType().Name);
+        }
+    }
+
+    private static Exception UnwrapStageException(Exception exception)
+    {
+        while (exception is StageProcessingException { InnerException: not null } stageException)
+        {
+            exception = stageException.InnerException!;
+        }
+
+        return exception;
     }
 
     private async Task TryDeleteUnregisteredAudioAsync(Guid turnId, string filePath)
@@ -539,5 +759,21 @@ public sealed class ConversationWorkflow : IConversationWorkflow
                 conversationId,
                 exception.GetType().Name);
         }
+    }
+
+    private sealed record SpeechSegment(int Sequence, string Text);
+
+    private sealed record StreamingTurnResult(
+        IReadOnlyList<Guid> OutputAudioIds);
+
+    private sealed class StageProcessingException : Exception
+    {
+        public StageProcessingException(ProcessingStage stage, Exception innerException)
+            : base($"Conversation processing failed at stage {stage}.", innerException)
+        {
+            Stage = stage;
+        }
+
+        public ProcessingStage Stage { get; }
     }
 }

@@ -5,11 +5,18 @@ namespace STSApp.Backend.Services.External;
 /// </summary>
 public sealed class DevelopmentMockGeminiClient : IGeminiClient
 {
-    public Task<string> GenerateReplyAsync(GeminiReplyRequest request, CancellationToken cancellationToken)
+    public async IAsyncEnumerable<string> StreamReplyAsync(
+        GeminiReplyRequest request,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
     {
         // recentTurns は直近履歴です。
         // ここでは件数だけ返答に含め、履歴を受け取れていることを画面上でも確認しやすくします。
         var reply = $"開発用Geminiの返答です。ユーザー発話「{request.UserText}」を受け取りました。直近履歴は{request.RecentTurns.Count}件です。";
-        return Task.FromResult(reply);
+        foreach (var sentence in reply.Split('。', StringSplitOptions.RemoveEmptyEntries))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            yield return sentence + "。";
+            await Task.Yield();
+        }
     }
 }

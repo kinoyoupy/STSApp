@@ -109,7 +109,7 @@ public sealed class ConversationsController : ControllerBase
             return Ok(new TurnCreatedResponse(
                 conversationId,
                 result.TurnId,
-                result.OutputAudioId));
+                result.OutputAudioIds));
         }
         catch (Exception ex) when (!DatabaseFailureDetector.IsDatabaseFailure(ex))
         {
