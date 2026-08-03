@@ -53,7 +53,7 @@ public sealed class ConversationWorkflowNotificationTests
             CancellationToken.None);
 
         Assert.Equal(repository.TurnId, result.TurnId);
-        Assert.Equal(repository.OutputAudioId, result.OutputAudioId);
+        Assert.Equal([repository.OutputAudioId], result.OutputAudioIds);
         Assert.True(repository.Completed);
         Assert.False(repository.Failed);
     }
@@ -228,6 +228,124 @@ public sealed class ConversationWorkflowNotificationTests
         Assert.Equal("Audio file registration failed.", exception.Message);
     }
 
+    [Fact]
+    public async Task Workflow_starts_first_tts_before_gemini_stream_completes_and_keeps_tts_sequential()
+    {
+        var conversationId = Guid.NewGuid();
+        var repository = new ConversationRepositoryStub(conversationId);
+        var gemini = new ControlledStreamingGeminiClient();
+        var tts = new RecordingTtsClient();
+        var workflow = new ConversationWorkflow(
+            repository,
+            new AudioFileStorageStub(),
+            new SttClientStub(),
+            new KnowledgeSearchServiceStub(),
+            new KnowledgeRepositoryStub(),
+            gemini,
+            tts,
+            new ThrowingHubContext(),
+            NullLogger<ConversationWorkflow>.Instance);
+        var audioFile = new FormFile(
+            new MemoryStream([1, 2, 3]),
+            0,
+            3,
+            "audioFile",
+            "recording.wav")
+        {
+            Headers = new HeaderDictionary(),
+            ContentType = "audio/wav"
+        };
+
+        var workflowTask = workflow.ProcessAudioTurnAsync(
+            conversationId,
+            audioFile,
+            CancellationToken.None);
+
+        await tts.FirstCallStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.False(gemini.StreamCompleted);
+
+        gemini.AllowCompletion.TrySetResult();
+        await workflowTask;
+
+        Assert.Equal(["一文目です。", "二文目です。"], tts.RequestTexts);
+        Assert.Equal(1, tts.MaximumConcurrency);
+    }
+
+    [Fact]
+    public async Task Workflow_keeps_partial_text_and_generated_audio_when_gemini_fails_mid_stream()
+    {
+        var conversationId = Guid.NewGuid();
+        var repository = new ConversationRepositoryStub(conversationId);
+        var firstTtsCompleted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var workflow = new ConversationWorkflow(
+            repository,
+            new AudioFileStorageStub(),
+            new SttClientStub(),
+            new KnowledgeSearchServiceStub(),
+            new KnowledgeRepositoryStub(),
+            new FailingAfterFirstSentenceGeminiClient(firstTtsCompleted.Task),
+            new SignalingTtsClient(firstTtsCompleted),
+            new ThrowingHubContext(),
+            NullLogger<ConversationWorkflow>.Instance);
+        var audioFile = new FormFile(
+            new MemoryStream([1, 2, 3]),
+            0,
+            3,
+            "audioFile",
+            "recording.wav")
+        {
+            Headers = new HeaderDictionary(),
+            ContentType = "audio/wav"
+        };
+
+        await Assert.ThrowsAnyAsync<Exception>(() => workflow.ProcessAudioTurnAsync(
+            conversationId,
+            audioFile,
+            CancellationToken.None));
+
+        Assert.True(repository.Failed);
+        Assert.Equal(ProcessingStage.Gemini, repository.FailureStage);
+        Assert.Equal("途中までです。", repository.AssistantText);
+        Assert.Equal(1, repository.OutputAudioCount);
+    }
+
+    [Fact]
+    public async Task Workflow_keeps_completed_text_and_prior_audio_when_later_tts_fails()
+    {
+        var conversationId = Guid.NewGuid();
+        var repository = new ConversationRepositoryStub(conversationId);
+        var workflow = new ConversationWorkflow(
+            repository,
+            new AudioFileStorageStub(),
+            new SttClientStub(),
+            new KnowledgeSearchServiceStub(),
+            new KnowledgeRepositoryStub(),
+            new ImmediateStreamingGeminiClient(),
+            new FailingSecondTtsClient(),
+            new ThrowingHubContext(),
+            NullLogger<ConversationWorkflow>.Instance);
+        var audioFile = new FormFile(
+            new MemoryStream([1, 2, 3]),
+            0,
+            3,
+            "audioFile",
+            "recording.wav")
+        {
+            Headers = new HeaderDictionary(),
+            ContentType = "audio/wav"
+        };
+
+        await Assert.ThrowsAnyAsync<Exception>(() => workflow.ProcessAudioTurnAsync(
+            conversationId,
+            audioFile,
+            CancellationToken.None));
+
+        Assert.True(repository.Failed);
+        Assert.Equal(ProcessingStage.Tts, repository.FailureStage);
+        Assert.Equal("一文目です。二文目です。", repository.AssistantText);
+        Assert.Equal(1, repository.OutputAudioCount);
+    }
+
     private sealed class ConversationRepositoryStub : IConversationRepository
     {
         private readonly Guid _conversationId;
@@ -242,6 +360,9 @@ public sealed class ConversationWorkflowNotificationTests
         public bool Completed { get; private set; }
         public bool Failed { get; private set; }
         public bool FailureTokenWasCancellationRequested { get; private set; }
+        public ProcessingStage? FailureStage { get; private set; }
+        public string? AssistantText { get; private set; }
+        public int OutputAudioCount { get; private set; }
         public AudioFileKind? FailingAudioKind { get; init; }
         public List<(TurnEventType EventType, string? Message)> Events { get; } = [];
 
@@ -276,6 +397,11 @@ public sealed class ConversationWorkflowNotificationTests
                     new DbUpdateException("Audio file registration failed."));
             }
 
+            if (kind == AudioFileKind.Output)
+            {
+                OutputAudioCount++;
+            }
+
             return Task.FromResult(new AudioFileDto(
                 kind == AudioFileKind.Output ? OutputAudioId : Guid.NewGuid(),
                 turnId,
@@ -299,6 +425,7 @@ public sealed class ConversationWorkflowNotificationTests
             CancellationToken cancellationToken)
         {
             Failed = true;
+            FailureStage = errorStage;
             FailureTokenWasCancellationRequested = cancellationToken.IsCancellationRequested;
             return Task.CompletedTask;
         }
@@ -318,7 +445,11 @@ public sealed class ConversationWorkflowNotificationTests
             return Task.CompletedTask;
         }
         public Task UpdateUserTextAsync(Guid turnId, string userText, CancellationToken cancellationToken) => Task.CompletedTask;
-        public Task UpdateAssistantTextAsync(Guid turnId, string assistantText, AnswerBasis answerBasis, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task UpdateAssistantTextAsync(Guid turnId, string assistantText, AnswerBasis answerBasis, CancellationToken cancellationToken)
+        {
+            AssistantText = assistantText;
+            return Task.CompletedTask;
+        }
         public Task<bool> ConversationExistsAsync(Guid conversationId, CancellationToken cancellationToken) => Task.FromResult(conversationId == _conversationId);
         public Task<ConversationDto> CreateConversationAsync(string? title, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<IReadOnlyList<ConversationDto>> ListConversationsAsync(CancellationToken cancellationToken) => throw new NotSupportedException();
@@ -372,8 +503,120 @@ public sealed class ConversationWorkflowNotificationTests
 
     private sealed class GeminiClientStub : IGeminiClient
     {
-        public Task<string> GenerateReplyAsync(GeminiReplyRequest request, CancellationToken cancellationToken)
-            => Task.FromResult("こんにちは。");
+        public async IAsyncEnumerable<string> StreamReplyAsync(
+            GeminiReplyRequest request,
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            yield return "こんにちは。";
+            await Task.Yield();
+        }
+    }
+
+    private sealed class ControlledStreamingGeminiClient : IGeminiClient
+    {
+        public TaskCompletionSource AllowCompletion { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public bool StreamCompleted { get; private set; }
+
+        public async IAsyncEnumerable<string> StreamReplyAsync(
+            GeminiReplyRequest request,
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            yield return "一文目です。";
+            await AllowCompletion.Task.WaitAsync(cancellationToken);
+            yield return "二文目です。";
+            StreamCompleted = true;
+        }
+    }
+
+    private sealed class RecordingTtsClient : ITtsClient
+    {
+        private int _activeCalls;
+
+        public TaskCompletionSource FirstCallStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public List<string> RequestTexts { get; } = [];
+        public int MaximumConcurrency { get; private set; }
+
+        public async Task<GeneratedSpeech> SynthesizeAsync(string text, CancellationToken cancellationToken)
+        {
+            RequestTexts.Add(text);
+            var activeCalls = Interlocked.Increment(ref _activeCalls);
+            MaximumConcurrency = Math.Max(MaximumConcurrency, activeCalls);
+            FirstCallStarted.TrySetResult();
+            try
+            {
+                await Task.Delay(10, cancellationToken);
+                return new GeneratedSpeech(new MemoryStream([1, 2, 3]), "audio/wav", ".wav");
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _activeCalls);
+            }
+        }
+    }
+
+    private sealed class FailingAfterFirstSentenceGeminiClient : IGeminiClient
+    {
+        private readonly Task _firstTtsCompleted;
+
+        public FailingAfterFirstSentenceGeminiClient(Task firstTtsCompleted)
+        {
+            _firstTtsCompleted = firstTtsCompleted;
+        }
+
+        public async IAsyncEnumerable<string> StreamReplyAsync(
+            GeminiReplyRequest request,
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            yield return "途中までです。";
+            await _firstTtsCompleted.WaitAsync(cancellationToken);
+            throw new InvalidOperationException("Gemini stream failed.");
+        }
+    }
+
+    private sealed class SignalingTtsClient : ITtsClient
+    {
+        private readonly TaskCompletionSource _completed;
+
+        public SignalingTtsClient(TaskCompletionSource completed)
+        {
+            _completed = completed;
+        }
+
+        public Task<GeneratedSpeech> SynthesizeAsync(string text, CancellationToken cancellationToken)
+        {
+            _completed.TrySetResult();
+            return Task.FromResult(new GeneratedSpeech(new MemoryStream([1, 2, 3]), "audio/wav", ".wav"));
+        }
+    }
+
+    private sealed class ImmediateStreamingGeminiClient : IGeminiClient
+    {
+        public async IAsyncEnumerable<string> StreamReplyAsync(
+            GeminiReplyRequest request,
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            await Task.Yield();
+            cancellationToken.ThrowIfCancellationRequested();
+            yield return "一文目です。";
+            yield return "二文目です。";
+        }
+    }
+
+    private sealed class FailingSecondTtsClient : ITtsClient
+    {
+        private int _callCount;
+
+        public Task<GeneratedSpeech> SynthesizeAsync(string text, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (Interlocked.Increment(ref _callCount) == 2)
+            {
+                throw new InvalidOperationException("TTS failed.");
+            }
+
+            return Task.FromResult(new GeneratedSpeech(new MemoryStream([1, 2, 3]), "audio/wav", ".wav"));
+        }
     }
 
     private sealed class TtsClientStub : ITtsClient

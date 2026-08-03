@@ -8,6 +8,7 @@ using STSApp.Contracts.Enums;
 using STSApp.Contracts.Events;
 using STSApp.Contracts.Models;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 
 namespace STSApp.Desktop;
@@ -21,9 +22,13 @@ public partial class MainWindow : Window
     private readonly VoiceInputSessionController _voiceInputController = new();
     private readonly AudioPlaybackService _audioPlaybackService = new();
     private readonly ChatMessageListController _chatMessages;
-    // SignalR通知とREST完了応答の両方から同じ音声IDが届くため、再生済みIDを覚えて二重再生を防ぎます。
+    // SignalR通知とREST完了応答を同じ順序付きキューへ集め、音声の重複・並行再生を防ぎます。
     private readonly HashSet<Guid> _completedAudioPlaybackIds = [];
-    private readonly Dictionary<Guid, Task<bool>> _activeAudioPlaybackTasks = [];
+    private readonly Dictionary<Guid, AudioTurnPlaybackState> _audioTurnPlaybackStates = [];
+    private readonly object _audioPlaybackQueueGate = new();
+    private readonly Dictionary<Guid, long> _transcriptionDisplayedTimestamps = [];
+    private readonly Dictionary<Guid, long> _speechEndedTimestamps = [];
+    private readonly HashSet<Guid> _latencyRecordedTurnIds = [];
     private readonly HashSet<Guid> _observedTurnIds = [];
     // 起動処理と履歴更新が同時に会話を作ろうとしても、作成APIは1本ずつ実行します。
     // 1画面で2つの会話IDが競合し、通知先と保存先が分かれることを防ぐためです。
@@ -36,6 +41,7 @@ public partial class MainWindow : Window
     private bool _isAudioPlaybackActive;
     private bool _isCloseConfirmationOpen;
     private bool _allowWindowClose;
+    private long? _latestSpeechEndedTimestamp;
 
     // Backendで作られた会話セッションIDです。
     // 音声アップロード、履歴取得、SignalR通知のフィルタリングで同じIDを使います。
@@ -72,26 +78,45 @@ public partial class MainWindow : Window
 
     private async void MainWindow_Opened(object? sender, EventArgs e)
     {
-        // SignalRを先に接続してから会話を作ります。
-        // これにより、後続の音声処理でBackendから送られる状態通知を受け取りやすくします。
-        await StartSignalRAsync();
-        await CreateConversationAsync();
+        try
+        {
+            // SignalRを先に接続してから会話を作ります。
+            // これにより、後続の音声処理でBackendから送られる状態通知を受け取りやすくします。
+            await StartSignalRAsync();
+            await CreateConversationAsync();
+        }
+        catch (Exception exception)
+        {
+            Trace.WriteLine($"Window startup failed: {exception.GetType().Name}");
+            AddErrorMessage("アプリの初期化に失敗しました。Backendの状態を確認して再起動してください。");
+        }
     }
 
     private async void MainWindow_Closed(object? sender, EventArgs e)
     {
         // 削除通知と録音・再生の停止は、Closingイベントで完了させています。
         // Closedでは画面破棄後に必要なリソースだけを解放します。
-        _windowClosingTokenSource.Cancel();
-        _windowClosingTokenSource.Dispose();
-        _chatMessages.Dispose();
-        _voiceInputController.StateChanged -= ApplyVoiceInputState;
-        _voiceInputController.ActivityChanged -= VoiceInputController_ActivityChanged;
-        _voiceInputController.AudioReady -= VoiceInputController_AudioReady;
-        _voiceInputController.ErrorOccurred -= VoiceInputController_ErrorOccurred;
-        _voiceInputController.Dispose();
-        _backendApiClient.Dispose();
-        await _conversationHubClient.DisposeAsync();
+        TryCleanupOnClose(_windowClosingTokenSource.Cancel);
+        TryCleanupOnClose(_chatMessages.Dispose);
+        TryCleanupOnClose(() => _voiceInputController.StateChanged -= ApplyVoiceInputState);
+        TryCleanupOnClose(() => _voiceInputController.ActivityChanged -= VoiceInputController_ActivityChanged);
+        TryCleanupOnClose(() => _voiceInputController.AudioReady -= VoiceInputController_AudioReady);
+        TryCleanupOnClose(() => _voiceInputController.ErrorOccurred -= VoiceInputController_ErrorOccurred);
+        TryCleanupOnClose(_voiceInputController.Dispose);
+        TryCleanupOnClose(_backendApiClient.Dispose);
+
+        try
+        {
+            await _conversationHubClient.DisposeAsync();
+        }
+        catch (Exception exception)
+        {
+            Trace.WriteLine($"SignalR disposal failed: {exception.GetType().Name}");
+        }
+        finally
+        {
+            TryCleanupOnClose(_windowClosingTokenSource.Dispose);
+        }
     }
 
     private async void MainWindow_Closing(object? sender, WindowClosingEventArgs e)
@@ -121,6 +146,14 @@ public partial class MainWindow : Window
             _allowWindowClose = true;
             Close();
         }
+        catch (Exception exception)
+        {
+            // async voidイベントから例外を外へ出すと、AvaloniaのUIスレッドが
+            // 未処理例外としてプロセスを終了するため、画面へ戻して再操作可能にします。
+            Trace.WriteLine($"Window closing failed: {exception.GetType().Name}");
+            StatusText.Text = "終了処理に失敗しました";
+            InputHintText.Text = "もう一度終了してください。繰り返す場合はアプリを再起動してください。";
+        }
         finally
         {
             _isCloseConfirmationOpen = false;
@@ -134,7 +167,15 @@ public partial class MainWindow : Window
         _playbackCancellationSource?.Cancel();
         _voiceInputController.StopSessionAndDiscard();
 
-        var playbackTasks = _activeAudioPlaybackTasks.Values.ToArray();
+        Task[] playbackTasks;
+        lock (_audioPlaybackQueueGate)
+        {
+            playbackTasks = _audioTurnPlaybackStates.Values
+                .Select(state => state.RunningTask)
+                .Where(task => task is not null)
+                .Cast<Task>()
+                .ToArray();
+        }
         if (playbackTasks.Length > 0)
         {
             try
@@ -222,6 +263,8 @@ public partial class MainWindow : Window
         // これにより、過去の会話を表示した後も、その会話へ続けて発話できます。
         _conversationId = conversation.Id;
         _completedAudioPlaybackIds.Clear();
+        _audioTurnPlaybackStates.Clear();
+        _chatMessages.ResetStreamingState();
 
         await TryJoinConversationNotificationsAsync(conversation.Id);
         var synchronized = await RefreshConversationTurnsAsync(showSyncMessage: false);
@@ -236,26 +279,37 @@ public partial class MainWindow : Window
 
     private void VoiceInputButton_Click(object? sender, RoutedEventArgs e)
     {
-        if (_isAudioPlaybackActive)
+        try
         {
-            _playbackCancellationSource?.Cancel();
-            StatusText.Text = "返答音声を停止しました";
-            InputHintText.Text = "次の発話を受け付ける準備をしています。";
-            return;
-        }
+            if (_isAudioPlaybackActive)
+            {
+                _playbackCancellationSource?.Cancel();
+                StatusText.Text = "返答音声を停止しました";
+                InputHintText.Text = "次の発話を受け付ける準備をしています。";
+                return;
+            }
 
-        if (_voiceInputController.State == VoiceInputState.Processing)
+            if (_voiceInputController.State == VoiceInputState.Processing)
+            {
+                return;
+            }
+
+            if (_voiceInputController.SessionEnabled)
+            {
+                _voiceInputController.StopSessionAndDiscard();
+                return;
+            }
+
+            _voiceInputController.StartSession();
+        }
+        catch (Exception exception)
         {
-            return;
+            // UIイベントから未処理例外を出さず、利用者が再起動できる状態を保ちます。
+            Trace.WriteLine($"Voice input button operation failed: {exception.GetType().Name}");
+            StatusText.Text = "音声入力操作失敗";
+            InputHintText.Text = "音声入力を操作できませんでした。アプリを再起動してください。";
+            AddErrorMessage("音声入力の開始または停止に失敗しました。");
         }
-
-        if (_voiceInputController.SessionEnabled)
-        {
-            _voiceInputController.StopSessionAndDiscard();
-            return;
-        }
-
-        _voiceInputController.StartSession();
     }
 
     private void VoiceInputController_ActivityChanged(VoiceInputSessionActivity activity)
@@ -272,6 +326,7 @@ public partial class MainWindow : Window
                 InputHintText.Text = "話し終えると自動で送信します。";
                 break;
             case VoiceInputSessionActivity.SpeechEnded:
+                _latestSpeechEndedTimestamp = Stopwatch.GetTimestamp();
                 StatusText.Text = "終話を検知しました";
                 InputHintText.Text = "音声を送信しています...";
                 break;
@@ -361,7 +416,7 @@ public partial class MainWindow : Window
             // これは内部的な同期です。利用者が押す「会話を同期」の完了文言を、
             // AI返答の処理中に表示しないため、同期完了メッセージは出しません。
             await RefreshConversationTurnsAsync(showSyncMessage: false);
-            await PlayAudioOnceAsync(result.OutputAudioId);
+            QueueCompletedAudioSequence(result.TurnId, result.OutputAudioIds);
         }
         catch (Exception ex)
         {
@@ -541,8 +596,29 @@ public partial class MainWindow : Window
 
                 _observedTurnIds.Add(value.TurnId);
                 AddUserMessage(value.UserText, value.TurnId);
+                _transcriptionDisplayedTimestamps[value.TurnId] = Stopwatch.GetTimestamp();
+                if (_latestSpeechEndedTimestamp is long speechEndedTimestamp)
+                {
+                    _speechEndedTimestamps[value.TurnId] = speechEndedTimestamp;
+                }
                 StatusText.Text = "文字起こし完了";
                 InputHintText.Text = "AI返答を生成しています。";
+            });
+        };
+
+        _conversationHubClient.AssistantTextChunkGenerated += value =>
+        {
+            RunOnUiThread(() =>
+            {
+                if (!IsCurrentConversation(value.ConversationId))
+                {
+                    return;
+                }
+
+                _observedTurnIds.Add(value.TurnId);
+                _chatMessages.AppendAssistantMessageChunk(value.TurnId, value.Sequence, value.Text);
+                StatusText.Text = "AI返答を受信中";
+                InputHintText.Text = "返答音声を準備しています。";
             });
         };
 
@@ -564,7 +640,7 @@ public partial class MainWindow : Window
 
         _conversationHubClient.SpeechSynthesisCompleted += value =>
         {
-            RunOnUiThread(async () =>
+            RunOnUiThread(() =>
             {
                 if (!IsCurrentConversation(value.ConversationId))
                 {
@@ -575,7 +651,23 @@ public partial class MainWindow : Window
                 StatusText.Text = "返答音声生成完了";
                 InputHintText.Text = "返答音声を再生しています。";
 
-                await PlayAudioOnceAsync(value.AudioId);
+                QueueCompletedAudioSequence(value.TurnId, value.AudioIds);
+            });
+        };
+
+        _conversationHubClient.SpeechSynthesisChunkCompleted += value =>
+        {
+            RunOnUiThread(() =>
+            {
+                if (!IsCurrentConversation(value.ConversationId))
+                {
+                    return;
+                }
+
+                _observedTurnIds.Add(value.TurnId);
+                StatusText.Text = "返答音声を受信中";
+                InputHintText.Text = "返答音声を再生しています。";
+                QueueAudioChunk(value.TurnId, value.Sequence, value.AudioId);
             });
         };
 
@@ -642,7 +734,134 @@ public partial class MainWindow : Window
 
     }
 
-    private async Task<bool> DownloadAndPlayAudioWithRetryAsync(Guid audioId)
+    private void QueueCompletedAudioSequence(Guid turnId, IReadOnlyList<Guid> audioIds)
+    {
+        lock (_audioPlaybackQueueGate)
+        {
+            var state = GetOrCreateAudioTurnPlaybackState(turnId);
+            state.Buffer.Restore(
+                audioIds,
+                audioId => _backendApiClient.DownloadAudioAsync(
+                    audioId,
+                    _windowClosingTokenSource.Token));
+        }
+
+        StartAudioTurnQueueIfNeeded(turnId);
+    }
+
+    private void QueueAudioChunk(Guid turnId, int sequence, Guid audioId)
+    {
+        lock (_audioPlaybackQueueGate)
+        {
+            var state = GetOrCreateAudioTurnPlaybackState(turnId);
+            state.Buffer.Add(
+                sequence,
+                audioId,
+                id => _backendApiClient.DownloadAudioAsync(
+                    id,
+                    _windowClosingTokenSource.Token));
+        }
+
+        StartAudioTurnQueueIfNeeded(turnId);
+    }
+
+    private AudioTurnPlaybackState GetOrCreateAudioTurnPlaybackState(Guid turnId)
+    {
+        if (!_audioTurnPlaybackStates.TryGetValue(turnId, out var state))
+        {
+            state = new AudioTurnPlaybackState();
+            _audioTurnPlaybackStates.Add(turnId, state);
+        }
+
+        return state;
+    }
+
+    private void StartAudioTurnQueueIfNeeded(Guid turnId)
+    {
+        AudioTurnPlaybackState state;
+        lock (_audioPlaybackQueueGate)
+        {
+            state = GetOrCreateAudioTurnPlaybackState(turnId);
+            if (state.IsRunning)
+            {
+                return;
+            }
+
+            if (state.Buffer.IsCancelled)
+            {
+                return;
+            }
+
+            if (!state.Buffer.HasNext && !state.Buffer.IsComplete)
+            {
+                return;
+            }
+
+            state.IsRunning = true;
+        }
+
+        var runningTask = ProcessAudioTurnQueueAsync(turnId, state);
+        lock (_audioPlaybackQueueGate)
+        {
+            state.RunningTask = runningTask;
+        }
+    }
+
+    private async Task ProcessAudioTurnQueueAsync(Guid turnId, AudioTurnPlaybackState state)
+    {
+        var completedNormally = false;
+        try
+        {
+            while (true)
+            {
+                BufferedAudioChunk<Task<byte[]>>? chunk;
+                lock (_audioPlaybackQueueGate)
+                {
+                    if (!state.Buffer.TryTakeNext(out chunk))
+                    {
+                        completedNormally = state.Buffer.IsComplete;
+                        return;
+                    }
+                }
+
+                if (!await DownloadAndPlayAudioWithRetryAsync(turnId, chunk))
+                {
+                    lock (_audioPlaybackQueueGate)
+                    {
+                        state.Buffer.Cancel();
+                    }
+
+                    return;
+                }
+
+                _completedAudioPlaybackIds.Add(chunk.AudioId);
+            }
+        }
+        finally
+        {
+            var shouldRestart = false;
+            lock (_audioPlaybackQueueGate)
+            {
+                state.IsRunning = false;
+                state.RunningTask = null;
+                shouldRestart = state.Buffer.HasNext;
+                completedNormally = completedNormally || state.Buffer.IsComplete;
+            }
+
+            if (completedNormally)
+            {
+                CompleteAudioTurnPlayback();
+            }
+            else if (shouldRestart)
+            {
+                StartAudioTurnQueueIfNeeded(turnId);
+            }
+        }
+    }
+
+    private async Task<bool> DownloadAndPlayAudioWithRetryAsync(
+        Guid turnId,
+        BufferedAudioChunk<Task<byte[]>> queuedChunk)
     {
         Exception? lastException = null;
         using var playbackCancellationSource = CancellationTokenSource.CreateLinkedTokenSource(
@@ -657,27 +876,22 @@ public partial class MainWindow : Window
             {
                 try
                 {
-                    var audioBytes = await _backendApiClient.DownloadAudioAsync(
-                        audioId,
-                        playbackCancellationSource.Token);
+                    var audioBytes = attempt == 1
+                        ? await queuedChunk.Value.WaitAsync(playbackCancellationSource.Token)
+                        : await _backendApiClient.DownloadAudioAsync(
+                            queuedChunk.AudioId,
+                            playbackCancellationSource.Token);
 
                     // 音声ファイルの取得が終わり、実際の再生を開始する直前にだけ
                     // 停止操作を有効にします。TTS生成中の中断は今回の対象外です。
                     _isAudioPlaybackActive = true;
                     ApplyVoiceInputState(VoiceInputState.Processing);
+                    RecordFirstAudioLatency(turnId);
                     await _audioPlaybackService.PlayWavAsync(
                         audioBytes,
                         playbackCancellationSource.Token);
 
                     _chatMessages.ClearDesktopErrors();
-                    if (!_voiceInputController.SessionEnabled)
-                    {
-                        StatusText.Text = "返答音声再生完了";
-                        InputHintText.Text = "音声入力開始を押して、話しかけてください。";
-                    }
-
-                    // 1回の開始操作で次の発話も受け付けるため、セッションが有効なら再生後に待機へ戻します。
-                    _voiceInputController.ResumeAfterResponse();
                     return true;
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
@@ -717,6 +931,38 @@ public partial class MainWindow : Window
         }
     }
 
+    private void RecordFirstAudioLatency(Guid turnId)
+    {
+        if (!_latencyRecordedTurnIds.Add(turnId))
+        {
+            return;
+        }
+
+        var now = Stopwatch.GetTimestamp();
+        var transcriptionToAudioMs = _transcriptionDisplayedTimestamps.TryGetValue(turnId, out var transcriptionTimestamp)
+            ? Stopwatch.GetElapsedTime(transcriptionTimestamp, now).TotalMilliseconds
+            : (double?)null;
+        var speechEndToAudioMs = _speechEndedTimestamps.TryGetValue(turnId, out var speechEndedTimestamp)
+            ? Stopwatch.GetElapsedTime(speechEndedTimestamp, now).TotalMilliseconds
+            : (double?)null;
+
+        Trace.WriteLine(
+            $"TurnLatency TurnId={turnId} SpeechEndToFirstAudioMs={speechEndToAudioMs:F0} "
+            + $"TranscriptionToFirstAudioMs={transcriptionToAudioMs:F0}");
+    }
+
+    private void CompleteAudioTurnPlayback()
+    {
+        _chatMessages.ClearDesktopErrors();
+        if (!_voiceInputController.SessionEnabled)
+        {
+            StatusText.Text = "返答音声再生完了";
+            InputHintText.Text = "音声入力開始を押して、話しかけてください。";
+        }
+
+        _voiceInputController.ResumeAfterResponse();
+    }
+
     private void ResumeAfterPlaybackCancellation()
     {
         // Window終了時は、入力待機へ戻す必要がありません。
@@ -724,32 +970,6 @@ public partial class MainWindow : Window
         if (!_windowClosingTokenSource.IsCancellationRequested)
         {
             _voiceInputController.ResumeAfterResponse();
-        }
-    }
-
-    private async Task PlayAudioOnceAsync(Guid audioId)
-    {
-        if (_completedAudioPlaybackIds.Contains(audioId))
-        {
-            return;
-        }
-
-        if (!_activeAudioPlaybackTasks.TryGetValue(audioId, out var playbackTask))
-        {
-            playbackTask = DownloadAndPlayAudioWithRetryAsync(audioId);
-            _activeAudioPlaybackTasks.Add(audioId, playbackTask);
-        }
-
-        try
-        {
-            if (await playbackTask)
-            {
-                _completedAudioPlaybackIds.Add(audioId);
-            }
-        }
-        finally
-        {
-            _activeAudioPlaybackTasks.Remove(audioId);
         }
     }
 
@@ -762,7 +982,31 @@ public partial class MainWindow : Window
 
     private static void RunOnUiThread(Action action)
     {
-        Dispatcher.UIThread.Post(action);
+        Dispatcher.UIThread.Post(() =>
+        {
+            try
+            {
+                action();
+            }
+            catch (Exception exception)
+            {
+                // SignalRコールバックの画面反映失敗でアプリ全体を終了させません。
+                Trace.WriteLine($"UI notification failed: {exception.GetType().Name}");
+            }
+        });
+    }
+
+    private static void TryCleanupOnClose(Action cleanup)
+    {
+        try
+        {
+            cleanup();
+        }
+        catch (Exception exception)
+        {
+            // 一つの解放失敗で後続リソースの解放を中断しません。
+            Trace.WriteLine($"Window cleanup failed: {exception.GetType().Name}");
+        }
     }
 
     private static string FormatStage(ProcessingStage stage)
@@ -910,6 +1154,13 @@ public partial class MainWindow : Window
         AnswerBasis? answerBasis = null)
     {
         _chatMessages.AddAssistantMessage(text, turnId, answerBasis);
+    }
+
+    private sealed class AudioTurnPlaybackState
+    {
+        public OrderedAudioChunkBuffer<Task<byte[]>> Buffer { get; } = new();
+        public bool IsRunning { get; set; }
+        public Task? RunningTask { get; set; }
     }
 
 }

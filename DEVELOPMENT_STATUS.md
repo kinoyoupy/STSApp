@@ -178,12 +178,15 @@
 
 - Backend側でAPIキーを管理する前提
 - ユーザー発話と直近履歴を渡す
+- Interactions APIのSSEで返答差分を受信
+- 文末が確定した文からTTS処理と並行実行
 - 返答テキストをDB保存
-- SignalRで返答テキスト完了通知
+- SignalRで文単位の途中通知と返答テキスト完了通知
 
 確認状況:
 
-- 実APIによる返答テキスト生成を確認済み
+- 従来の実APIによる返答テキスト生成は確認済み
+- SSEストリーミングは自動テスト済み、実API・RAGありで応答開始時間を5回測定済み
 - 実際の値はGit管理対象外のローカル設定で管理
 
 ### TTS
@@ -201,11 +204,12 @@
 - HTTP 200でも、実データがWAVとして成立するかを保存前に検証
 - 返答音声を保存
 - `audio_files.kind = output` としてDB保存
-- SignalRで `audioId` を通知
+- 文単位で1件ずつ生成し、SignalRで文番号と `audioId` を通知
 
 確認状況:
 
 - 実APIによるWAV生成と自動再生を確認済み
+- 文単位の複数リクエストと順序再生は自動テスト・ビルド・実機測定済み
 - 実際の値はGit管理対象外のローカル設定で管理
 
 ### Vector RAG
@@ -231,7 +235,9 @@
 - SignalR接続
   - `turnStatusChanged`
   - `transcriptionCompleted`
+  - `assistantTextChunkGenerated`
   - `assistantTextCompleted`
+  - `speechSynthesisChunkCompleted`
   - `speechSynthesisCompleted`
   - `turnFailed`
 - VADによる連続音声入力
@@ -246,6 +252,7 @@
   - 16bit PCM
   - WAV形式へ変換
 - macOS `afplay` によるWAV再生
+- 文番号順の音声再生キューと後続WAVの先読み
 - Desktop側のBackend URL設定ファイル化
   - `STSApp.Desktop/appsettings.json`
   - `backendBaseUrl`
@@ -266,7 +273,8 @@
   - `turn_events`
   - RAG資料、Embedding、参照履歴
 - SignalR通知の元になるイベントがDBに保存されることを確認
-- Backend自動テスト32件成功
+- Backend自動テスト53件成功
+- Desktop自動テスト7件成功
 - ソリューション全体のビルドが警告0・エラー0で成功
 
 ## 現在の注意点
@@ -275,6 +283,7 @@
 - `UseDevelopmentMocks=true`ではRAGをモック化しないため、現在の会話処理はRAG段階で停止する
 - 過去の手動ファイル削除によって、開発DBには参照先ファイルが存在しない古い音声レコードが残っている
 - プロセス強制終了まで含めた孤立音声・一時ファイルの自動回収は未実装
+- 音声停止・終了処理は例外安全化済み。診断起動ではマイク権限を取得できないため、通常起動での実マイク停止確認が必要
 - Avaloniaのビルド確認時は、この環境では次の環境変数を付けている
   - `AVALONIA_TELEMETRY_OPTOUT=1`
 

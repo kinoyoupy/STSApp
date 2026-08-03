@@ -84,7 +84,7 @@ Gemini APIを使わない場合、STTによって「ユーザーが何を言っ�
 - 直近数ターンの会話履歴
 - システムの振る舞いを決める指示文
 
-Gemini APIの公式ドキュメントでは、テキスト生成、ストリーミング応答、複数ターン会話が扱えます。初期版は通常のテキスト生成を使い、ストリーミングや高度な会話継続は将来拡張として扱います。
+Gemini APIの公式ドキュメントでは、テキスト生成、ストリーミング応答、複数ターン会話が扱えます。本システムではInteractions APIのSSEストリーミングを使い、完成した文からTTSへ渡します。高度な会話継続は将来拡張として扱います。
 
 参考:
 
@@ -136,13 +136,19 @@ sequenceDiagram
     Backend->>DB: STT完了イベントを保存
     Backend-->>App: ユーザー発話テキストを通知
     Backend->>Gemini: 発話テキスト + 直近履歴を送信
-    Gemini-->>Backend: AI返答文
+    loop 文末が確定するたび
+        Gemini-->>Backend: AI返答の差分
+        Backend-->>App: 確定した1文を通知
+        Backend->>TTS: 確定した1文を送信
+        TTS-->>Backend: 1文分の返答音声
+        Backend->>DB: 音声参照とチャンク時間を保存
+        Backend-->>App: 文番号と再生用音声を通知
+        App->>User: 文番号順に音声再生
+    end
     Backend->>DB: Gemini完了イベントを保存
-    Backend-->>App: AI返答テキストを通知
-    Backend->>TTS: AI返答文を送信
-    TTS-->>Backend: 返答音声
+    Backend-->>App: AI返答全文を通知
     Backend->>DB: TTS完了イベントを保存
-    Backend-->>App: 再生用音声を通知
+    Backend-->>App: 全音声ID一覧を通知
     Backend->>DB: 発話、返答、音声参照、処理結果を保存
     App->>User: ユーザー発話、AI返答、音声再生を段階的に反映
 ```
@@ -218,7 +224,7 @@ sequenceDiagram
 
 ## 9. 応答体験の比較
 
-<span style="color:red">応答体験は `テキストだけ先に表示` を採用します。</span>
+<span style="color:red">応答体験は `文単位の逐次表示・逐次音声再生` を採用します。</span>
 
 <span style="color:red">通信方式は `REST + SignalR` を採用しますが、SignalRで受け取った詳細状態をそのまま細かくユーザーに見せる必要はありません。ユーザー向けには自然なチャット更新を優先し、内部的には詳細状態をキャッチできるようにします。</span>
 
@@ -227,10 +233,10 @@ sequenceDiagram
 | 方式 | 体験 | 実装の考え方 | 補足 |
 | --- | --- | --- | --- |
 | 完了後まとめて表示 | STT、Gemini、TTSが全部終わってから表示・再生 | 最終結果をまとめて扱う | まとめて出せるメリットはあるが、自分の発話内容をすぐ確認できない。 |
-| テキストだけ先に表示 | ユーザー発話とAI返答テキストを先に表示し、TTS音声は後から再生 | テキストと音声生成を分けて扱う | 採用。チャットUIとしての反応が早く、認識結果も確認しやすい。 |
-| 逐次表示 | Gemini返答を少しずつチャットに表示 | SignalRやストリーミングを使って表示を更新する | メリットは大きいが、PushToTalkという特性を考えた時に初期版で必要かは慎重に扱う。 |
+| テキストだけ先に表示 | ユーザー発話とAI返答テキストを先に表示し、TTS音声は後から再生 | テキストと音声生成を分けて扱う | 全文と音声全体の完成待ちが残る。 |
+| 文単位の逐次表示・再生 | Gemini返答を文単位で表示し、完成した文からTTS生成・再生 | SSE、SignalR、順序付き音声キューを使う | 採用。最初の音声が始まるまでの待ち時間を短縮する。 |
 
-### 9.1 テキストだけ先に表示を採用する理由
+### 9.1 逐次表示・再生を採用する理由
 
 <span style="color:red">自分の発話したことが即座に画面に反映されるのは、AI側の認識が間違えていないかを確認できる点でも有用です。</span>
 
@@ -246,16 +252,16 @@ sequenceDiagram
 
 この場合、ユーザーは「自分の言い方が悪かったのか」「STTが聞き間違えたのか」「Geminiの返答がずれたのか」を判断しづらくなります。
 
-そのため、まずSTT結果としてユーザーの発話をチャットに表示し、その後Geminiの返答テキストを表示し、最後にTTS音声を再生する流れにします。
+そのため、まずSTT結果としてユーザーの発話をチャットに表示します。その後はGeminiの全文完成を待たず、文末が確定した文をアシスタントカードへ追記し、同じ文をTTSへ送って順番に再生します。
 
 ```text
 録音終了
   ↓
 ユーザー発話をチャットに表示
   ↓
-AI返答テキストをチャットに表示
+AI返答の1文目を表示・TTS生成
   ↓
-TTS音声を再生
+1文目を再生しながら後続文を生成
 ```
 
 ### 9.2 SignalRとの関係
@@ -267,8 +273,10 @@ SignalRは、ユーザーに細かい状態を全部見せるためではなく�
 | SignalRイベント | Avalonia側の扱い | ユーザー向け表示 |
 | --- | --- | --- |
 | `transcriptionCompleted` | STT結果を受け取り、ユーザー発話として表示 | ユーザー発話の吹き出し |
-| `assistantTextCompleted` | Gemini返答を受け取り、AI返答として表示 | AI返答の吹き出し |
-| `speechSynthesisCompleted` | TTS音声を受け取り、再生可能にする | 音声再生 |
+| `assistantTextChunkGenerated` | 完成した文を既存のAI返答カードへ追記 | AI返答の吹き出し |
+| `assistantTextCompleted` | Gemini全文を受け取り、カード本文を確定 | AI返答の吹き出し |
+| `speechSynthesisChunkCompleted` | 文番号と音声IDを受け取り、順序付き再生キューへ追加 | 音声再生 |
+| `speechSynthesisCompleted` | 全音声ID一覧を受け取り、取り逃した通知を補完 | 音声再生 |
 | `turnFailed` | 失敗箇所を受け取り、状態を更新する | エラー表示 |
 
 RESTは処理開始や履歴取得を担当し、SignalRは途中結果や状態変化の通知を担当します。
@@ -284,11 +292,13 @@ AI返答テキスト: 表示する
 音声再生: 音声生成に失敗したことを表示する
 ```
 
-### 9.4 逐次表示の扱い
+### 9.4 文と音声の分割規則
 
-<span style="color:red">逐次表示はメリットが大きい一方で、PushToTalkという特性を考えた時に、初期版で必要かは疑問が残ります。</span>
+Geminiの差分は `。`、`！`、`？`、`!`、`?`、改行で区切ります。読点や固定文字数では分割せず、ストリーム終了時に残った文は句点がなくても最後の1文として扱います。TTSは1件ずつ呼び出し、Desktopは後続音声を先読みしながら文番号順に再生します。
 
-PushToTalkでは、ユーザーが話す区切りが明確です。そのため、まずは発話単位でSTT結果とAI返答を表示する形で十分に自然な体験を作れます。
+途中でGeminiまたはTTSが失敗した場合、既に表示・保存・再生した部分は取り消しません。部分テキストをDBへ残し、ターン全体は `failed` として記録します。
+
+PushToTalkではユーザー発話の区切りを明確にし、その後のAI返答は文単位で逐次表示・生成・再生することで、自然さを保ちながら応答開始を早めます。
 
 ## 10. MySQLに保存する内容
 
@@ -455,6 +465,8 @@ DBにはUTCで保存し、画面表示時にローカル時刻へ変換します
 
 `conversation_turns` には `stt_duration_ms`、`gemini_duration_ms`、`tts_duration_ms` は持たせません。処理段階ごとの時間は `turn_events.duration_ms` を見ます。
 
+ストリーミングではGeminiとTTSが並行するため、両者の完了時間は単純に足し合わせません。Geminiの最初の文が確定するまでの時間、各TTSチャンクの生成時間、Gemini全体、TTS全体を別イベントとして記録します。
+
 例:
 
 | stage | event_type | duration_ms |
@@ -490,7 +502,7 @@ DBにはUTCで保存し、画面表示時にローカル時刻へ変換します
 
 ## 11. Backendの主な処理
 
-Backendは、Avaloniaから音声を受け取った後、次の順番で処理します。
+Backendは、Avaloniaから音声を受け取った後、次の流れで処理します。
 
 1. 音声ファイルを受け取る。
 2. `turn_id` を確定し、会話ターンを `processing` としてMySQLに作成する。
@@ -498,11 +510,11 @@ Backendは、Avaloniaから音声を受け取った後、次の順番で処理�
 4. STT APIを呼び出してユーザー発話テキストを得る。
 5. STT結果を保存し、SignalRでAvaloniaへ通知する。
 6. 直近数ターンの履歴をMySQLから取得する。
-7. ユーザー発話と履歴をGemini APIへ送る。
-8. Geminiの返答文を保存し、SignalRでAvaloniaへ通知する。
-9. TTS APIを呼び出して返答音声を生成する。
-10. 返答音声の参照情報を `audio_files` に保存し、SignalRでAvaloniaへ通知する。
-11. 会話ターンを `completed` として更新する。
+7. ユーザー発話と履歴をGemini APIへ送り、SSEで差分を受信する。
+8. 文末が確定した文をSignalRで通知し、同時にTTSキューへ追加する。
+9. Gemini受信を続けながら、TTSキューを1件ずつ処理する。
+10. 各音声の参照情報を `audio_files` に保存し、文番号と音声IDをSignalRで通知する。
+11. Gemini全文を保存し、全TTS音声が完成した後に会話ターンを `completed` として更新する。
 
 途中で失敗した場合は、失敗箇所を `error_stage` に記録し、ターンを `failed` として保存します。あわせて、失敗イベントを `turn_events` に保存し、SignalRでAvaloniaへ通知します。
 
@@ -542,8 +554,10 @@ SignalRでは、状態とイベントを分けて扱います。
 | イベント | 意味 |
 | --- | --- |
 | `transcriptionCompleted` | STT結果のユーザー発話テキストを通知 |
-| `assistantTextCompleted` | Gemini返答テキストを通知 |
-| `speechSynthesisCompleted` | TTS音声の生成完了を通知 |
+| `assistantTextChunkGenerated` | 文番号と確定した1文を通知 |
+| `assistantTextCompleted` | Gemini返答全文の確定を通知 |
+| `speechSynthesisChunkCompleted` | 文番号と生成済み音声IDを通知 |
+| `speechSynthesisCompleted` | 全音声ID一覧とTTS全体の完了を通知 |
 | `turnFailed` | 失敗箇所とエラー情報を通知 |
 
 ## 13. チャットUI設計

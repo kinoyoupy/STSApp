@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
 using Avalonia.Threading;
@@ -61,15 +62,15 @@ public sealed class VoiceInputSessionController : IDisposable
         catch (Exception exception)
         {
             // 停止時の後片付けエラーは通知しますが、利用者の停止操作自体は完了させます。
-            ErrorOccurred?.Invoke(new VoiceInputSessionError(
+            NotifySafely(() => ErrorOccurred?.Invoke(new VoiceInputSessionError(
                 VoiceInputSessionErrorKind.Stop,
-                exception.Message));
+                exception.Message)));
         }
 
         _voiceActivityDetector.EndRecording();
         _voiceEndpointDetector.EndRecording();
         SetState(VoiceInputState.Ready);
-        ActivityChanged?.Invoke(VoiceInputSessionActivity.ListeningStopped);
+        NotifySafely(() => ActivityChanged?.Invoke(VoiceInputSessionActivity.ListeningStopped));
     }
 
     public void ResumeAfterResponse()
@@ -103,12 +104,12 @@ public sealed class VoiceInputSessionController : IDisposable
 
     public void Dispose()
     {
-        CancelFrameWatchdog();
-        _audioRecorder.FrameCaptured -= _voiceActivityDetector.ProcessFrame;
-        _voiceActivityDetector.FrameClassified -= _voiceEndpointDetector.ProcessVoiceActivity;
-        _voiceEndpointDetector.StateChanged -= VoiceEndpointDetector_StateChanged;
-        _audioRecorder.Dispose();
-        _voiceActivityDetector.Dispose();
+        TryCleanup(CancelFrameWatchdog);
+        TryCleanup(() => _audioRecorder.FrameCaptured -= _voiceActivityDetector.ProcessFrame);
+        TryCleanup(() => _voiceActivityDetector.FrameClassified -= _voiceEndpointDetector.ProcessVoiceActivity);
+        TryCleanup(() => _voiceEndpointDetector.StateChanged -= VoiceEndpointDetector_StateChanged);
+        TryCleanup(_audioRecorder.Dispose);
+        TryCleanup(_voiceActivityDetector.Dispose);
     }
 
     private void StartListeningCore(int startupAttempt = 0)
@@ -122,7 +123,7 @@ public sealed class VoiceInputSessionController : IDisposable
             _voiceEndpointDetector.BeginRecording();
             _audioRecorder.StartListening();
             SetState(VoiceInputState.Listening);
-            ActivityChanged?.Invoke(VoiceInputSessionActivity.ListeningStarted);
+            NotifySafely(() => ActivityChanged?.Invoke(VoiceInputSessionActivity.ListeningStarted));
 
             var watchdogCancellation = new CancellationTokenSource();
             _frameWatchdogCancellation = watchdogCancellation;
@@ -135,9 +136,9 @@ public sealed class VoiceInputSessionController : IDisposable
             _voiceEndpointDetector.EndRecording();
             TryStopAndDiscard();
             SetState(VoiceInputState.Error);
-            ErrorOccurred?.Invoke(new VoiceInputSessionError(
+            NotifySafely(() => ErrorOccurred?.Invoke(new VoiceInputSessionError(
                 VoiceInputSessionErrorKind.Start,
-                exception.Message));
+                exception.Message)));
         }
     }
 
@@ -145,7 +146,7 @@ public sealed class VoiceInputSessionController : IDisposable
     {
         // 音声判定はマイク用スレッドから届きます。
         // 録音の開始・停止と画面側イベントはUIスレッドへ順番に戻し、同時実行を避けます。
-        Dispatcher.UIThread.Post(() => HandleVoiceEndpointStateChanged(state));
+        Dispatcher.UIThread.Post(() => NotifySafely(() => HandleVoiceEndpointStateChanged(state)));
     }
 
     private void HandleVoiceEndpointStateChanged(VoiceEndpointState state)
@@ -174,7 +175,7 @@ public sealed class VoiceInputSessionController : IDisposable
             CancelFrameWatchdog();
             _audioRecorder.BeginAudioCapture();
             SetState(VoiceInputState.Recording);
-            ActivityChanged?.Invoke(VoiceInputSessionActivity.SpeechStarted);
+            NotifySafely(() => ActivityChanged?.Invoke(VoiceInputSessionActivity.SpeechStarted));
         }
         catch (Exception exception)
         {
@@ -185,9 +186,9 @@ public sealed class VoiceInputSessionController : IDisposable
             _voiceActivityDetector.EndRecording();
             _voiceEndpointDetector.EndRecording();
             SetState(VoiceInputState.Error);
-            ErrorOccurred?.Invoke(new VoiceInputSessionError(
+            NotifySafely(() => ErrorOccurred?.Invoke(new VoiceInputSessionError(
                 VoiceInputSessionErrorKind.CaptureStart,
-                exception.Message));
+                exception.Message)));
         }
     }
 
@@ -201,7 +202,7 @@ public sealed class VoiceInputSessionController : IDisposable
         _isCompletingUtterance = true;
         CancelFrameWatchdog();
         SetState(VoiceInputState.Processing);
-        ActivityChanged?.Invoke(VoiceInputSessionActivity.SpeechEnded);
+        NotifySafely(() => ActivityChanged?.Invoke(VoiceInputSessionActivity.SpeechEnded));
 
         try
         {
@@ -209,7 +210,7 @@ public sealed class VoiceInputSessionController : IDisposable
             var audio = _audioRecorder.StopAndGetAudio();
             _voiceActivityDetector.EndRecording();
             _voiceEndpointDetector.EndRecording();
-            AudioReady?.Invoke(audio);
+            NotifySafely(() => AudioReady?.Invoke(audio));
         }
         catch (Exception exception)
         {
@@ -217,9 +218,9 @@ public sealed class VoiceInputSessionController : IDisposable
             _voiceActivityDetector.EndRecording();
             _voiceEndpointDetector.EndRecording();
             SetState(VoiceInputState.Error);
-            ErrorOccurred?.Invoke(new VoiceInputSessionError(
+            NotifySafely(() => ErrorOccurred?.Invoke(new VoiceInputSessionError(
                 VoiceInputSessionErrorKind.Finalize,
-                exception.Message));
+                exception.Message)));
         }
         finally
         {
@@ -230,7 +231,7 @@ public sealed class VoiceInputSessionController : IDisposable
     private void SetState(VoiceInputState state)
     {
         State = state;
-        StateChanged?.Invoke(state);
+        NotifySafely(() => StateChanged?.Invoke(state));
     }
 
     private void TryStopAndDiscard()
@@ -293,9 +294,9 @@ public sealed class VoiceInputSessionController : IDisposable
             _voiceEndpointDetector.EndRecording();
             TryStopAndDiscard();
             SetState(VoiceInputState.Error);
-            ErrorOccurred?.Invoke(new VoiceInputSessionError(
+            NotifySafely(() => ErrorOccurred?.Invoke(new VoiceInputSessionError(
                 VoiceInputSessionErrorKind.NoAudioFrame,
-                "マイク入力を開始できませんでした。入力デバイスを確認して、もう一度お試しください。"));
+                "マイク入力を開始できませんでした。入力デバイスを確認して、もう一度お試しください。")));
         });
     }
 
@@ -320,6 +321,30 @@ public sealed class VoiceInputSessionController : IDisposable
 
         cancellation.Cancel();
         cancellation.Dispose();
+    }
+
+    private static void NotifySafely(Action notification)
+    {
+        try
+        {
+            notification();
+        }
+        catch (Exception exception)
+        {
+            Trace.WriteLine($"Voice input notification failed: {exception.GetType().Name}");
+        }
+    }
+
+    private static void TryCleanup(Action cleanup)
+    {
+        try
+        {
+            cleanup();
+        }
+        catch (Exception exception)
+        {
+            Trace.WriteLine($"Voice input cleanup failed: {exception.GetType().Name}");
+        }
     }
 }
 

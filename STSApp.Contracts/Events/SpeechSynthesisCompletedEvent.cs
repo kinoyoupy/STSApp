@@ -1,10 +1,9 @@
 namespace STSApp.Contracts.Events;
 
 /// <summary>
-/// TTS音声の生成が完了した時に、BackendからAvaloniaへ通知するイベントです。
-/// audioId は audio_files.id に対応します。
+/// 1ターン分のTTS音声がすべて生成された時に通知するイベントです。
 /// </summary>
 public sealed record SpeechSynthesisCompletedEvent(
     Guid ConversationId,
     Guid TurnId,
-    Guid AudioId);
+    IReadOnlyList<Guid> AudioIds);

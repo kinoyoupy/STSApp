@@ -1,5 +1,8 @@
 using System.Net.Http.Json;
+using System.Net.Http.Headers;
+using System.Runtime.CompilerServices;
 using System.Text;
+using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.Extensions.Options;
 using STSApp.Backend.Options;
@@ -8,7 +11,7 @@ namespace STSApp.Backend.Services.External;
 
 /// <summary>
 /// Gemini APIをHTTPで呼び出す実装です。
-/// 初期版ではストリーミングを使わず、1回のリクエストで返答テキストを受け取ります。
+/// Interactions APIのSSEを使い、生成されたテキストを差分で返します。
 /// </summary>
 public sealed class HttpGeminiClient : IGeminiClient
 {
@@ -23,7 +26,9 @@ public sealed class HttpGeminiClient : IGeminiClient
         _options = options.Value.Gemini;
     }
 
-    public async Task<string> GenerateReplyAsync(GeminiReplyRequest replyRequest, CancellationToken cancellationToken)
+    public async IAsyncEnumerable<string> StreamReplyAsync(
+        GeminiReplyRequest replyRequest,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(_options.ApiKey))
         {
@@ -40,15 +45,20 @@ public sealed class HttpGeminiClient : IGeminiClient
         // APIキーはAvalonia側には置かず、BackendからGeminiへ送ります。
         // DesktopアプリにAPIキーを入れると、配布時にキーが見えやすくなるためです。
         request.Headers.Add("x-goog-api-key", _options.ApiKey);
+        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/event-stream"));
 
         // Geminiへは「モデル名」「システム指示」「入力テキスト」を送ります。
         // 入力テキストには、現在の発話だけでなく直近履歴も含めます。
         request.Content = JsonContent.Create(new GeminiRequest(
             _options.ModelName,
             BuildSystemInstruction(replyRequest.AnswerBasis),
-            BuildInput(replyRequest)));
+            BuildInput(replyRequest),
+            Stream: true));
 
-        using var response = await _httpClient.SendAsync(request, cancellationToken);
+        using var response = await _httpClient.SendAsync(
+            request,
+            HttpCompletionOption.ResponseHeadersRead,
+            cancellationToken);
         if (!response.IsSuccessStatusCode)
         {
             // 応答本文に入力文や会話内容が含まれても、ログやDBへ残さないよう状態コードだけを扱います。
@@ -56,20 +66,70 @@ public sealed class HttpGeminiClient : IGeminiClient
                 $"Gemini API request failed. StatusCode={(int)response.StatusCode}.");
         }
 
-        var result = await response.Content.ReadFromJsonAsync<GeminiResponse>(cancellationToken);
+        await using var responseStream = await response.Content.ReadAsStreamAsync(cancellationToken);
+        using var reader = new StreamReader(responseStream);
+        var dataLines = new List<string>();
+        var receivedText = false;
+        var completed = false;
 
-        if (result is null)
+        while (true)
         {
-            throw new InvalidOperationException("Gemini API response was empty.");
+            var line = await reader.ReadLineAsync(cancellationToken);
+            if (line is not null && line.Length > 0)
+            {
+                if (line.StartsWith("data:", StringComparison.Ordinal))
+                {
+                    dataLines.Add(line[5..].TrimStart());
+                }
+
+                continue;
+            }
+
+            if (dataLines.Count > 0)
+            {
+                var eventData = string.Join("\n", dataLines);
+                dataLines.Clear();
+
+                if (!string.Equals(eventData, "[DONE]", StringComparison.Ordinal))
+                {
+                    var streamEvent = ParseStreamEvent(eventData);
+                    if (string.Equals(streamEvent.EventType, "interaction.failed", StringComparison.OrdinalIgnoreCase))
+                    {
+                        throw new InvalidOperationException("Gemini API streaming interaction failed.");
+                    }
+
+                    if (string.Equals(streamEvent.EventType, "interaction.completed", StringComparison.OrdinalIgnoreCase))
+                    {
+                        completed = true;
+                    }
+
+                    var delta = streamEvent.Delta;
+                    var deltaText = delta?.Text;
+                    if (string.Equals(streamEvent.EventType, "step.delta", StringComparison.OrdinalIgnoreCase)
+                        && string.Equals(delta?.Type, "text", StringComparison.OrdinalIgnoreCase)
+                        && !string.IsNullOrEmpty(deltaText))
+                    {
+                        receivedText = true;
+                        yield return deltaText;
+                    }
+                }
+            }
+
+            if (line is null)
+            {
+                break;
+            }
         }
 
-        var outputText = result.GetOutputText();
-        if (string.IsNullOrWhiteSpace(outputText))
+        if (!completed)
+        {
+            throw new InvalidOperationException("Gemini API stream ended before completion.");
+        }
+
+        if (!receivedText)
         {
             throw new InvalidOperationException("Gemini API response did not contain output text.");
         }
-
-        return outputText.Trim();
     }
 
     private string BuildSystemInstruction(STSApp.Contracts.Enums.AnswerBasis answerBasis)
@@ -127,49 +187,32 @@ public sealed class HttpGeminiClient : IGeminiClient
     private sealed record GeminiRequest(
         [property: JsonPropertyName("model")] string Model,
         [property: JsonPropertyName("system_instruction")] string SystemInstruction,
-        [property: JsonPropertyName("input")] string Input);
+        [property: JsonPropertyName("input")] string Input,
+        [property: JsonPropertyName("stream")] bool Stream);
 
-    private sealed class GeminiResponse
+    private static GeminiStreamEvent ParseStreamEvent(string eventData)
     {
-        [JsonPropertyName("output_text")]
-        public string? OutputText { get; init; }
-
-        [JsonPropertyName("steps")]
-        public IReadOnlyList<GeminiStep>? Steps { get; init; }
-
-        public string? GetOutputText()
+        try
         {
-            if (!string.IsNullOrWhiteSpace(OutputText))
-            {
-                return OutputText;
-            }
-
-            // Interactions APIでは、返答文がsteps内のmodel_outputに入る場合があります。
-            // その中からtext形式の内容を取り出し、複数の文章があれば順番に結合します。
-            var modelOutputTexts = Steps?
-                .Where(step => string.Equals(step.Type, "model_output", StringComparison.OrdinalIgnoreCase))
-                .SelectMany(step => step.Content ?? Array.Empty<GeminiContent>())
-                .Where(content => string.Equals(content.Type, "text", StringComparison.OrdinalIgnoreCase))
-                .Select(content => content.Text)
-                .Where(text => !string.IsNullOrWhiteSpace(text))
-                .ToArray();
-
-            return modelOutputTexts is { Length: > 0 }
-                ? string.Join(Environment.NewLine, modelOutputTexts)
-                : null;
+            return JsonSerializer.Deserialize<GeminiStreamEvent>(eventData)
+                ?? throw new InvalidOperationException("Gemini API stream event was empty.");
+        }
+        catch (JsonException exception)
+        {
+            throw new InvalidOperationException("Gemini API returned an invalid stream event.", exception);
         }
     }
 
-    private sealed class GeminiStep
+    private sealed class GeminiStreamEvent
     {
-        [JsonPropertyName("type")]
-        public string? Type { get; init; }
+        [JsonPropertyName("event_type")]
+        public string? EventType { get; init; }
 
-        [JsonPropertyName("content")]
-        public IReadOnlyList<GeminiContent>? Content { get; init; }
+        [JsonPropertyName("delta")]
+        public GeminiDelta? Delta { get; init; }
     }
 
-    private sealed class GeminiContent
+    private sealed class GeminiDelta
     {
         [JsonPropertyName("type")]
         public string? Type { get; init; }

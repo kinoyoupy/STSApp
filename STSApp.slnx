@@ -3,4 +3,5 @@
   <Project Path="STSApp.Contracts/STSApp.Contracts.csproj" />
   <Project Path="STSApp.Desktop/STSApp.Desktop.csproj" />
   <Project Path="STSApp.Backend.Tests/STSApp.Backend.Tests.csproj" />
+  <Project Path="STSApp.Desktop.Tests/STSApp.Desktop.Tests.csproj" />
 </Solution>
