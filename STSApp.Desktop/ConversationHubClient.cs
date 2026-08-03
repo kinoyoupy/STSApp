@@ -40,10 +40,31 @@ public sealed class ConversationHubClient : IAsyncDisposable
         {
             // SignalRのグループ参加状態は再接続時に作り直す必要があります。
             // 会話IDを覚えておき、自動再接続後も同じ会話の通知を受け取れるようにします。
-            if (_joinedConversationId is not null)
+            try
             {
-                await JoinConversationCoreAsync(_joinedConversationId.Value, CancellationToken.None);
+                if (_joinedConversationId is not null)
+                {
+                    await JoinConversationCoreAsync(_joinedConversationId.Value, CancellationToken.None);
+                }
+
+                Reconnected?.Invoke();
             }
+            catch (Exception exception)
+            {
+                ConnectionClosed?.Invoke(exception);
+            }
+        };
+
+        _connection.Reconnecting += exception =>
+        {
+            Reconnecting?.Invoke(exception);
+            return Task.CompletedTask;
+        };
+
+        _connection.Closed += exception =>
+        {
+            ConnectionClosed?.Invoke(exception);
+            return Task.CompletedTask;
         };
 
         _connection.On<TurnStatusChangedEvent>("turnStatusChanged", value =>
@@ -79,6 +100,9 @@ public sealed class ConversationHubClient : IAsyncDisposable
     public event Action<AssistantTextCompletedEvent>? AssistantTextCompleted;
     public event Action<SpeechSynthesisCompletedEvent>? SpeechSynthesisCompleted;
     public event Action<TurnFailedEvent>? TurnFailed;
+    public event Action<Exception?>? Reconnecting;
+    public event Action? Reconnected;
+    public event Action<Exception?>? ConnectionClosed;
 
     public async Task StartAsync(CancellationToken cancellationToken)
     {

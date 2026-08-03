@@ -68,6 +68,28 @@ public sealed class ChatMessageListController : IDisposable
         AddMessage(ChatMessageItem.Assistant(text, turnId, answerBasis));
     }
 
+    public void ClearDesktopErrors()
+    {
+        // Desktop内の接続・マイク・再生エラーはDBへ保存されないため、turnIdを持ちません。
+        // その後に同じ処理が成功した時は、古い失敗を画面へ残すと現在も失敗中に見えるため消します。
+        for (var index = _messages.Count - 1; index >= 0; index--)
+        {
+            var message = _messages[index];
+            if (message.Kind != ChatMessageKind.Error || message.TurnId is not null)
+            {
+                continue;
+            }
+
+            _messages.RemoveAt(index);
+            _messagesPanel.Children.RemoveAt(index);
+        }
+
+        if (_messages.Count == 0)
+        {
+            AddMessage(ChatMessageItem.EmptyState());
+        }
+    }
+
     public void ReplaceFromTurns(IReadOnlyList<ConversationTurnDto> turns)
     {
         // SignalRで届いた発話は、履歴取得の瞬間にはDBへ保存されていない場合があります。

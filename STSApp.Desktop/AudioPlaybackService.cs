@@ -58,7 +58,28 @@ public sealed class AudioPlaybackService
             throw new InvalidOperationException("Could not start afplay.");
         }
 
-        await process.WaitForExitAsync(cancellationToken);
+        try
+        {
+            await process.WaitForExitAsync(cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            // 待機処理だけをキャンセルしてもafplay自体は音声を再生し続けます。
+            // 利用者が停止した時に実際の音も止めるため、再生プロセスを終了します。
+            try
+            {
+                if (!process.HasExited)
+                {
+                    process.Kill();
+                }
+            }
+            catch (InvalidOperationException)
+            {
+                // キャンセルと自然終了が同時に起きた場合は、すでに終了しているため何もしません。
+            }
+
+            throw;
+        }
 
         if (process.ExitCode != 0)
         {

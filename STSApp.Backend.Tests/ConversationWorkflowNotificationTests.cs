@@ -345,6 +345,9 @@ public sealed class ConversationWorkflowNotificationTests
                 : Task.FromException(DeleteException);
         }
 
+        public Task<IReadOnlyList<string>> ListFilePathsAsync(CancellationToken cancellationToken)
+            => Task.FromResult<IReadOnlyList<string>>([]);
+
         public Task<Stream?> OpenReadAsync(string filePath, CancellationToken cancellationToken)
             => throw new NotSupportedException();
     }

@@ -9,6 +9,12 @@ typedef struct STSContinuousAudioRecorder STSContinuousAudioRecorder;
 // callback中のsamplesは次のcallbackまでしか有効ではないため、必要なら呼び出し側でコピーします。
 typedef void (*STSAudioFrameCallback)(const int16_t *samples, int sample_count, void *context);
 
+// macOSが現在のDesktopアプリへマイク利用を許可しているかを確認します。
+// 許可されている場合は1、それ以外の場合は0を返し、理由をerror_messageへ書き込みます。
+int sts_continuous_audio_recorder_check_microphone_permission(
+    char *error_message,
+    int error_capacity);
+
 // VADが発話開始・終話を判断できるよう、録音中の音声フレームを継続して受け取ります。
 // 完成WAVの保存は、発話開始が確定してから別メソッドで始めます。
 STSContinuousAudioRecorder *sts_continuous_audio_recorder_create(

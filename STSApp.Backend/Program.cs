@@ -51,6 +51,8 @@ if (!string.IsNullOrWhiteSpace(mysqlConnectionString))
 builder.Services.AddScoped<DatabaseHealthCheck>();
 builder.Services.AddScoped<DatabaseInitializer>();
 builder.Services.AddScoped<IConversationRepository, ConversationRepository>();
+builder.Services.AddScoped<IAudioFileCleanupRepository, AudioFileCleanupRepository>();
+builder.Services.AddScoped<IAudioFileCleanupService, AudioFileCleanupService>();
 builder.Services.AddScoped<IKnowledgeRepository, KnowledgeRepository>();
 builder.Services.AddScoped<IAudioFileStorage, LocalAudioFileStorage>();
 builder.Services.AddSingleton<MarkdownKnowledgeChunkParser>();
@@ -166,6 +168,13 @@ using (var scope = app.Services.CreateScope())
     // 前回のBackend停止でprocessingのまま残ったターンは、次の会話と混同しないよう起動時に回収します。
     // Development以外ではスキーマ作成は行いませんが、既存データの状態回収は同じように必要です。
     await initializer.RecoverInterruptedTurnsAsync(CancellationToken.None);
+
+    var audioCleanupService = scope.ServiceProvider.GetService<IAudioFileCleanupService>();
+    if (audioCleanupService is not null)
+    {
+        // 前回のBackend停止や登録失敗で残った音声を、会話本文を残したまま整理します。
+        await audioCleanupService.CleanupOrphanedAudioAsync(CancellationToken.None);
+    }
 }
 
 app.MapControllers();

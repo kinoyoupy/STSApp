@@ -334,7 +334,7 @@ public sealed class ConversationWorkflow : IConversationWorkflow
             var userMessage = failureStage switch
             {
                 ProcessingStage.Database => "会話データをDBへ保存できませんでした。",
-                ProcessingStage.Tts => "返答音声を生成できませんでした。",
+                ProcessingStage.Tts => "返答音声を生成できませんでした。TTS APIのURLと設定、TTS APIの稼働状態を確認してください。",
                 ProcessingStage.Gemini => "AI返答を生成できませんでした。",
                 ProcessingStage.Rag => "関連資料を検索できませんでした。",
                 _ => "音声を文字に変換できませんでした。"

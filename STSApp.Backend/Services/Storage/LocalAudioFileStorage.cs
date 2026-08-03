@@ -93,6 +93,32 @@ public sealed class LocalAudioFileStorage : IAudioFileStorage
         return Task.CompletedTask;
     }
 
+    public Task<IReadOnlyList<string>> ListFilePathsAsync(
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var storageRootPath = Path.GetFullPath(
+            Path.Combine(_environment.ContentRootPath, _options.AudioRootPath));
+        if (!Directory.Exists(storageRootPath))
+        {
+            return Task.FromResult<IReadOnlyList<string>>(Array.Empty<string>());
+        }
+
+        var filePaths = Directory
+            .EnumerateFiles(storageRootPath, "*", SearchOption.AllDirectories)
+            .Where(path => !string.Equals(
+                Path.GetFileName(path),
+                ".DS_Store",
+                StringComparison.OrdinalIgnoreCase))
+            .Select(path => NormalizePath(Path.GetRelativePath(
+                _environment.ContentRootPath,
+                path)))
+            .ToList();
+
+        return Task.FromResult<IReadOnlyList<string>>(filePaths);
+    }
+
     public Task<Stream?> OpenReadAsync(
         string filePath,
         CancellationToken cancellationToken)

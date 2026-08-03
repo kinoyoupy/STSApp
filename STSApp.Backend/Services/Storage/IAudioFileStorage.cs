@@ -22,6 +22,9 @@ public interface IAudioFileStorage
         string filePath,
         CancellationToken cancellationToken);
 
+    Task<IReadOnlyList<string>> ListFilePathsAsync(
+        CancellationToken cancellationToken);
+
     Task<Stream?> OpenReadAsync(
         string filePath,
         CancellationToken cancellationToken);

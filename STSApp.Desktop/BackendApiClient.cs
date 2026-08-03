@@ -72,6 +72,19 @@ public sealed class BackendApiClient : IDisposable
         return result.ConversationId;
     }
 
+    public async Task<IReadOnlyList<ConversationDto>> ListConversationsAsync(
+        CancellationToken cancellationToken)
+    {
+        // 会話一覧は、過去の会話を選ぶための表示用データです。
+        // 会話本文を一覧に含めず、選択後にターン取得APIを呼ぶことで、一覧を軽く保ちます。
+        var conversations = await _httpClient.GetFromJsonAsync<IReadOnlyList<ConversationDto>>(
+            "api/conversations",
+            JsonOptions,
+            cancellationToken);
+
+        return conversations ?? Array.Empty<ConversationDto>();
+    }
+
     public async Task<IReadOnlyList<ConversationTurnDto>> ListConversationTurnsAsync(
         Guid conversationId,
         CancellationToken cancellationToken)
@@ -161,6 +174,21 @@ public sealed class BackendApiClient : IDisposable
         await stream.CopyToAsync(memoryStream, cancellationToken);
 
         return memoryStream.ToArray();
+    }
+
+    public async Task DeleteConversationAudioAsync(
+        Guid conversationId,
+        CancellationToken cancellationToken)
+    {
+        using var response = await _httpClient.DeleteAsync(
+            $"api/conversations/{conversationId}/audio",
+            cancellationToken);
+
+        if (!response.IsSuccessStatusCode)
+        {
+            var errorMessage = await ReadShortErrorMessageAsync(response, cancellationToken);
+            throw new InvalidOperationException(errorMessage);
+        }
     }
 
     public void Dispose()
